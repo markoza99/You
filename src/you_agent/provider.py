@@ -34,7 +34,10 @@ class Provider:
             data=json.dumps(body).encode(),
             headers={
                 "Content-Type": "application/json",
+                "Accept": "application/json",
                 "Authorization": "Bearer " + self.key,
+                # Cloudflare on vyceai.com blocks Python-urllib's default User-Agent (error 1010).
+                "User-Agent": "You-Termux-Agent/0.2 (+https://github.com/markoza99/You)",
             },
         )
         try:
@@ -44,10 +47,19 @@ class Provider:
                 raise ProviderError("API response exceeded size limit.")
             data = json.loads(raw)
         except urllib.error.HTTPError as exc:
+            try:
+                err_body = exc.read(500).decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            if exc.code == 403 and ("1010" in err_body or "cloudflare" in err_body.lower()):
+                raise ProviderError(
+                    "HTTP 403 from Cloudflare (error 1010): the request was blocked before the API. "
+                    "This is not an invalid-key error."
+                ) from None
             messages_map = {
                 400: "Invalid request or unsupported model feature.",
                 401: "Authentication failed.",
-                403: "API key or model access denied.",
+                403: "Access denied (HTTP 403). Check the API key, model access, and whether Cloudflare blocked the request.",
                 404: "Model or endpoint unavailable; check YOU_MODEL and YOU_API_BASE.",
                 429: "Rate limit (HTTP 429). Wait and retry. This is not necessarily a billing failure.",
             }

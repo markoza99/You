@@ -147,6 +147,7 @@ def test_provider_request(monkeypatch):
     def urlopen(req, timeout):
         body = json.loads(req.data)
         assert req.get_header('Authorization') == 'Bearer fake'
+        assert req.get_header('User-agent')
         assert 'fake' not in req.full_url
         assert body['model'] == 'deepseek-v4-flash'
         assert body['messages'][0]['role'] == 'system'

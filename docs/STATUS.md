@@ -9,7 +9,7 @@
 - Interactive approval for each write and optional Python script, noninteractive default denial.
 - Script inspection, changed-script check, minimal child environment, timeout/output limits, cancellation cleanup.
 - API-key redaction in file contents and final responses; no conversation or prompt logs persisted.
-- Step/token/runtime thresholds, offline tests, desktop CI, installation instructions.
+- Step/token/runtime thresholds, offline tests and installation instructions. Desktop CI configuration is prepared in the downloadable ZIP but not published because workflow-file permissions are missing.
 
 ## Not yet verified
 

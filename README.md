@@ -77,7 +77,7 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
-Tests use fake provider replies and never need a real key or network access. CI runs the same suite on desktop Linux. See `docs/STATUS.md` for implemented versus pending roadmap items.
+Tests use fake provider replies and never need a real key or network access. The CI configuration is included in the downloadable ZIP but is not installed in this repository because the GitHub connection cannot write workflow files. Run the tests locally for now. See `docs/STATUS.md` for implemented versus pending roadmap items.
 
 ## Next milestones
 

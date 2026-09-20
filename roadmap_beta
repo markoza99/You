@@ -1,1 +1,200 @@
-under development 
+# You — Termux AI Agent Roadmap
+
+## Vision
+
+Build a general-purpose personal AI agent running in Termux on Android, powered by the Gemini API. It should understand a goal, plan useful steps, use tools, inspect results, recover from errors, and report what it actually achieved.
+
+“Do anything” means an extensible tool system for tasks the device, connected services, permissions, and budget support—not unlimited Android access or guaranteed success. The model runs in Google's cloud; Termux hosts the agent runtime and local tools. An internet connection is required for Gemini requests.
+
+## Starting point
+
+The repository currently contains only this roadmap; implementation has not started. Milestones below are proposed, not completed. Start with one reliable agent, not a multi-agent framework.
+
+Google's documentation lists `gemini-3.6-flash` and supports function calling, structured output, thinking, search grounding, and multimodal input. Use this requested model as the configurable default; confirm account access with a smoke test. Never silently substitute another model. Image/audio generation requires separate capabilities; multimodal input does not imply these outputs.
+
+## Architecture
+
+```text
+CLI / later voice interface
+          |
+Task controller + saved task state
+          |
+Gemini adapter <-> bounded agent loop
+                         |
+                 policy + approval gate
+                         |
+                   tool dispatcher
+                         |
+        files | commands | web | Android | APIs
+                         |
+             structured results + verification
+```
+
+Cross-cutting components: SQLite memory, context management, redacted event logs, budgets, cancellation, and tests. The policy gate is application code outside model control.
+
+### Recommended stack
+
+- Python with a lightweight CLI; SQLite for tasks and memory.
+- Official `google-genai` SDK behind a small adapter. Validate installation on Termux early; if native dependencies fail, use a minimal HTTPS REST adapter without changing the core agent.
+- Standard-library subprocess tools with argument arrays, timeouts, and capped output; avoid unrestricted `shell=True`.
+- `pytest` for tests; Git for changes and rollback of tracked project files.
+- Optional Termux:API companion app plus CLI package for supported Android features. Check app/package compatibility and Android permissions per feature.
+- No root requirement, heavy agent framework, vector database, or multi-agent system for the MVP.
+
+## Milestone 0 — Foundation and connectivity
+
+- [ ] Add README, package layout, dependency configuration, `.gitignore`, and a secret-free example configuration.
+- [ ] Document supported Android/Termux versions and installation sources after device testing.
+- [ ] Add a `doctor` command: Python/dependencies, network, writable private workspace, model access, and optional Android tools.
+- [ ] Configure `GEMINI_API_KEY` locally; never commit it, print it, or send it to tools/model context. Keep persistent secrets in private Termux storage, not shared Android storage.
+- [ ] Make model ID configurable with `gemini-3.6-flash` as the default.
+- [ ] Add a simple chat command with clear handling of invalid credentials, network errors, rate limits, and unavailable models.
+
+**Done when:** a fresh install on the target phone completes a Gemini request, reports configuration errors clearly, and exposes no secret in logs or Git.
+
+## Milestone 1 — Reliable tool-using MVP
+
+- [ ] Implement the loop: receive goal -> request model action -> validate tool call -> authorize -> execute -> return result -> continue or finish.
+- [ ] Preserve required Gemini conversation/tool-call metadata using the API/SDK conventions; return structured tool errors rather than crashing.
+- [ ] Start with `list_files`, `read_file`, `write_file`, `search_files`, and narrowly scoped command execution.
+- [ ] Give each tool a schema, risk level, timeout, output-size limit, and structured result containing success/error and evidence.
+- [ ] Default file access to a dedicated workspace; reject path traversal and symlink escapes.
+- [ ] Require approval for command execution initially. Show exact arguments, working directory, expected writes, and network implications.
+- [ ] Add maximum steps, runtime, API usage budgets, cancellation, and bounded retries. Never retry potentially completed side effects blindly.
+- [ ] Mark tasks as completed, failed, cancelled, or awaiting user input. Never equate a model's success claim with verified execution.
+
+**Done when:** the agent can create a small script in its workspace, execute it after approval, inspect its output, fix a simple error, and report the evidence. A repeated failing command stops within its limits.
+
+## Milestone 2 — Planning, memory, and context
+
+- [ ] Represent complex tasks as short plans with dependencies, progress, and explicit completion checks.
+- [ ] Store task state, tool events, and resumable checkpoints in SQLite.
+- [ ] Keep recent relevant messages plus compact summaries; retrieve files/memory on demand instead of stuffing all history into each request.
+- [ ] Separate durable user preferences from temporary observations. Record source and timestamp; let the user inspect/delete memory.
+- [ ] Start memory retrieval with SQLite full-text search; add embeddings only if evaluations demonstrate a need.
+- [ ] Detect repeated failure, no-progress loops, conflicting instructions, and missing permissions; ask for clarification when needed.
+- [ ] Retry transient API failures with backoff, not authentication or validation failures.
+
+**Done when:** a multi-step task resumes after restart without repeating completed side effects, and forgotten/deleted memories no longer enter new requests.
+
+## Milestone 3 — Research and coding assistant
+
+- [ ] Add grounded web research where supported, URL retrieval with size/time limits, and source citations.
+- [ ] Restrict URL schemes and block unintended access to local/private network endpoints, including through redirects.
+- [ ] Treat web pages, files, and command output as untrusted data—not instructions that can authorize tools or reveal secrets.
+- [ ] Add Git status/diff and project search tools; require approval for pushes, destructive operations, installs, and external uploads.
+- [ ] Edit existing code with targeted patches, inspect diffs, and run focused tests.
+- [ ] Build reusable task templates with declared inputs, permissions, dependencies, and success checks.
+
+**Done when:** the agent produces a source-backed research report and independently completes a small code change in a test repository, showing the diff and real test results.
+
+## Milestone 4 — Android assistance and service integrations
+
+- [ ] Add capability discovery: expose only installed, permitted Android tools.
+- [ ] Begin with battery/device status and local notifications; then optional clipboard, speech-to-text, and text-to-speech.
+- [ ] Make microphone, camera, location, and clipboard access explicit and user-controlled. Obtain permission before uploading sensitive device data to Gemini.
+- [ ] Add chosen API integrations one at a time with minimum scopes and separate credentials.
+- [ ] Require confirmation for messages, public posts, purchases, deletions, and account changes.
+- [ ] Consider Tasker or a user-enabled accessibility bridge only as a later optional integration; document its permissions and device-specific limits.
+
+**Done when:** the agent performs supported phone tasks with consent and explains unavailable capabilities instead of pretending to control other apps.
+
+**Android constraints:** Termux does not bypass Android app isolation. Most other apps' private data and arbitrary UI control are unavailable by default. Background jobs may be killed by Android; document battery settings, checkpoint tasks, and never promise uninterrupted execution. PRoot is not a security sandbox.
+
+## Milestone 5 — Bounded autonomy
+
+- [ ] Add a persistent job queue, schedules, checkpoints, and notification of completion/failure.
+- [ ] Provide permission presets: read-only, confirm-each-action, and bounded autonomous operation.
+- [ ] Let the user pre-authorize specific tools/resources for specific tasks with time and usage limits; no universal auto-approve mode.
+- [ ] Apply per-task and daily budgets. Track API usage and estimated cost with configurable pricing; token limits alone are not a guaranteed monetary cap.
+- [ ] Separate task planning from final verification, using deterministic checks wherever possible.
+- [ ] Add parallel workers only after single-agent reliability is established; isolate their workspaces and share one global budget.
+
+**Done when:** an approved scheduled task finishes or safely pauses under network loss, process restart, and permission changes without duplicate messages or uncontrolled spending.
+
+## Milestone 6 — Evaluation and release
+
+- [ ] Build at least 20 representative tasks across files, coding, research, memory, Android, and error recovery.
+- [ ] Measure verified completion rate, tool errors, latency, API usage, estimated cost, and approval burden.
+- [ ] Test malicious page/file instructions, secret leakage, workspace escapes, loops, timeouts, cancellation, and interrupted side effects.
+- [ ] Run ordinary unit tests in CI and a separate smoke suite on real Termux hardware; desktop CI cannot establish Android compatibility.
+- [ ] Support backups, schema migrations, release notes, dependency pinning, and rollback instructions.
+- [ ] Allow self-improvement only through proposed patches, tests, and human review. The agent must not rewrite its own approval rules or install unreviewed capabilities.
+
+**Proposed release gate:** at least 80% verified completion on the defined benchmark, all permission/secret-protection tests passing, no unbounded loops, and a documented phone installation that another user can reproduce. This is a target, not a current result.
+
+## Permission design from day one
+
+A model chooses proposed actions; ordinary code decides whether they are allowed. Approval should bind to the exact tool arguments and expire when they change. Logs should record decisions and results while redacting secrets and unnecessary personal data.
+
+A workspace restriction is useful but is NOT a strong sandbox for arbitrary Python or shell commands: subprocesses normally inherit Termux's access. Do not run untrusted downloaded code there. For risky execution, use a genuinely isolated remote worker with no personal credentials. Keep the local executor deliberately limited.
+
+## Proposed repository structure
+
+```text
+README.md
+roadmap_beta
+pyproject.toml
+.env.example
+src/you_agent/
+  cli.py
+  config.py
+  providers/gemini.py
+  agent/loop.py
+  agent/planner.py
+  agent/context.py
+  policy.py
+  approvals.py
+  tools/registry.py
+  tools/files.py
+  tools/commands.py
+  tools/web.py
+  tools/android.py
+  memory.py
+  tasks.py
+  telemetry.py
+tests/
+  unit/
+  integration/
+  safety/
+  termux/
+docs/
+  installation.md
+  architecture.md
+  permissions.md
+```
+
+## Suggested delivery order
+
+For one developer, use milestones rather than a fixed promise. A rough planning allowance is 6–10 weeks for a useful beta, depending heavily on experience, device constraints, and integration scope.
+
+1. Connectivity and device setup.
+2. Safe tool loop and one verified end-to-end coding task.
+3. Persistent tasks, relevant memory, and context handling.
+4. Research and coding tools.
+5. Android/service features selected by actual use cases.
+6. Scheduling, reliability evaluation, and release hardening.
+
+Do not start with voice, a graphical interface, multiple agents, or unrestricted shell access. The first release should prove that one agent can act correctly and verify its own work.
+
+## First implementation sprint
+
+1. Create the package, configuration, and installation guide.
+2. Implement `doctor` and the Gemini adapter.
+3. Implement the bounded agent loop and schema validation.
+4. Add workspace file tools and an approved command runner.
+5. Add tests for path escapes, secret redaction, tool errors, and loop limits.
+6. Demonstrate: “Create a script that summarizes a CSV, run it, and save a report,” with real outputs and explicit approval for execution.
+
+## How to make the most of the model
+
+Useful capability comes from clear goals, relevant context, well-described tools, reliable execution, and feedback—not from a prompt saying “you can do anything.” Tune thinking effort for task difficulty, retrieve only useful context, cache stable context where beneficial, and measure changes against repeatable tasks. Increase autonomy only when reliability improves.
+
+## References
+
+- Requested repository: https://github.com/markoza99/You
+- Verified Gemini model documentation: https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash
+- Function calling: https://ai.google.dev/gemini-api/docs/function-calling
+- Structured outputs: https://ai.google.dev/gemini-api/docs/structured-output
+
+Documentation checked September 20, 2026. API availability and device compatibility still require testing during implementation.

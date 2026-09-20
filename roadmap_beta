@@ -8,7 +8,7 @@ Build a general-purpose personal AI agent running in Termux on Android, powered 
 
 ## Starting point
 
-The repository currently contains only this roadmap; implementation has not started. Milestones below are proposed, not completed. Start with one reliable agent, not a multi-agent framework.
+Implementation has started with the v0.1 foundation prototype: CLI, Gemini REST adapter, workspace tools, approvals, bounded execution, and offline tests. See docs/STATUS.md for delivered and pending work. Milestones below remain acceptance checklists, not completed claims; live Gemini and real Termux validation are still pending. Start with one reliable agent, not a multi-agent framework.
 
 Google's documentation lists `gemini-3.6-flash` and supports function calling, structured output, thinking, search grounding, and multimodal input. Use this requested model as the configurable default; confirm account access with a smoke test. Never silently substitute another model. Image/audio generation requires separate capabilities; multimodal input does not imply these outputs.
 

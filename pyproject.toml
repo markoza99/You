@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "you-termux-agent"
+version = "0.1.0"
+description = "Approval-controlled Gemini agent for Termux"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+you = "you_agent.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

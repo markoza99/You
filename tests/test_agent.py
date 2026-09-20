@@ -6,7 +6,7 @@ from urllib.error import HTTPError
 import pytest
 from you_agent.tools import Tools, LIMIT
 from you_agent.cli import run_agent, main, approval
-from you_agent.provider import Gemini, ProviderError
+from you_agent.provider import Provider, ProviderError
 
 
 @pytest.fixture
@@ -99,34 +99,40 @@ def test_changed_after_approval(tools):
 class Fake:
     def __init__(self, replies):
         self.replies = iter(replies)
-        self.contents = []
-    def generate(self, contents, system, tools=None):
-        self.contents.append(json.loads(json.dumps(contents)))
+        self.messages = []
+    def generate(self, messages, system, tools=None):
+        self.messages.append(json.loads(json.dumps(messages)))
         return next(self.replies), {'totalTokenCount': 10}
 
 
-def test_loop_preserves_signature_and_id(tools):
-    call = {'role': 'model', 'parts': [{'thoughtSignature': 'opaque', 'functionCall': {
-        'name': 'write_file', 'args': {'path': 'a', 'content': 'hello'}, 'id': 'call1'}}]}
-    fake = Fake([call, {'role': 'model', 'parts': [{'text': 'Created.'}]}])
+def test_loop_preserves_tool_call_id(tools):
+    call = {'role': 'assistant', 'content': None, 'tool_calls': [{
+        'id': 'call1', 'type': 'function',
+        'function': {'name': 'write_file', 'arguments': json.dumps({'path': 'a', 'content': 'hello'})}}]}
+    fake = Fake([call, {'role': 'assistant', 'content': 'Created.'}])
     result = run_agent(fake, tools, 'create a file')
     assert result['status'] == 'answered'
-    assert fake.contents[1][1] == call
-    assert fake.contents[1][2]['parts'][0]['functionResponse']['id'] == 'call1'
+    assert fake.messages[1][1] == call
+    assert fake.messages[1][2]['role'] == 'tool'
+    assert fake.messages[1][2]['tool_call_id'] == 'call1'
 
 
 def test_step_limit(tools):
-    call = {'role': 'model', 'parts': [{'functionCall': {'name': 'list_files', 'args': {'path': '.'}}}]}
+    call = {'role': 'assistant', 'tool_calls': [{'id': 'c1', 'type': 'function',
+        'function': {'name': 'list_files', 'arguments': '{"path": "."}'}}]}
     assert run_agent(Fake([call]), tools, 'list', max_steps=1)['status'] == 'limit_reached'
 
 
 def test_token_threshold_prevents_tool(tools):
-    call = {'role': 'model', 'parts': [{'functionCall': {'name': 'write_file', 'args': {'path': 'a', 'content': 'x'}}}]}
+    call = {'role': 'assistant', 'tool_calls': [{'id': 'c1', 'type': 'function',
+        'function': {'name': 'write_file', 'arguments': '{"path": "a", "content": "x"}'}}]}
     assert run_agent(Fake([call]), tools, 'write', max_tokens=5)['status'] == 'limit_reached'
     assert not (tools.root / 'a').exists()
 
 
 def test_no_key(monkeypatch, capsys):
+    monkeypatch.delenv('YOU_API_KEY', raising=False)
+    monkeypatch.delenv('VYCEAI_API_KEY', raising=False)
     monkeypatch.delenv('GEMINI_API_KEY', raising=False)
     assert main(['chat', 'hi']) == 1
     assert 'missing' in capsys.readouterr().out
@@ -140,14 +146,17 @@ def test_noninteractive_denial(monkeypatch):
 def test_provider_request(monkeypatch):
     def urlopen(req, timeout):
         body = json.loads(req.data)
-        assert req.get_header('X-goog-api-key') == 'fake'
+        assert req.get_header('Authorization') == 'Bearer fake'
         assert 'fake' not in req.full_url
-        assert body['contents'][0]['role'] == 'user'
-        return io.BytesIO(json.dumps({'candidates': [{'finishReason': 'STOP', 'content': {
-            'role': 'model', 'parts': [{'text': 'OK'}]}}]}).encode())
+        assert body['model'] == 'deepseek-v4-flash'
+        assert body['messages'][0]['role'] == 'system'
+        assert body['messages'][1]['role'] == 'user'
+        return io.BytesIO(json.dumps({'choices': [{'finish_reason': 'stop', 'message': {
+            'role': 'assistant', 'content': 'OK'}}], 'usage': {'total_tokens': 3}}).encode())
     monkeypatch.setattr('urllib.request.urlopen', urlopen)
-    content, _ = Gemini('fake').generate([{'role': 'user', 'parts': [{'text': 'hi'}]}], 'system')
-    assert content['parts'][0]['text'] == 'OK'
+    message, usage = Provider('fake').generate([{'role': 'user', 'content': 'hi'}], 'system')
+    assert message['content'] == 'OK'
+    assert usage['totalTokenCount'] == 3
 
 
 @pytest.mark.parametrize('status', [400, 401, 403, 404, 429, 500])
@@ -156,12 +165,19 @@ def test_provider_errors_do_not_leak(monkeypatch, status):
         raise HTTPError('url', status, 'fake-secret', {}, None)
     monkeypatch.setattr('urllib.request.urlopen', fail)
     with pytest.raises(ProviderError) as exc:
-        Gemini('fake-secret').generate([], 's')
+        Provider('fake-secret').generate([], 's')
     assert 'fake-secret' not in str(exc.value)
 
 
 def test_incomplete_response(monkeypatch):
     monkeypatch.setattr('urllib.request.urlopen', lambda *a, **kw: io.BytesIO(json.dumps({
-        'candidates': [{'finishReason': 'MAX_TOKENS', 'content': {'parts': [{'text': 'partial'}]}}]}).encode()))
+        'choices': [{'finish_reason': 'length', 'message': {'role': 'assistant', 'content': 'partial'}}]}).encode()))
     with pytest.raises(ProviderError):
-        Gemini('fake').generate([], 's')
+        Provider('fake').generate([], 's')
+
+
+def test_openai_tool_schema(tools):
+    schema = tools.openai_tools
+    assert schema[0]['type'] == 'function'
+    assert schema[0]['function']['parameters']['type'] == 'object'
+    assert schema[0]['function']['parameters']['properties']['path']['type'] == 'string'

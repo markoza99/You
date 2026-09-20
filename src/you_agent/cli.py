@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 import time
 
-from .provider import Gemini, ProviderError
+from .provider import Provider, ProviderError
 from .tools import Tools
 
 SYSTEM = '''You are You, a personal Termux assistant. Work only on the user's goal.
@@ -16,11 +16,11 @@ Writes and execution need user approval. Respect denial; do not work around it.
 Do not claim actions happened without successful tool results. A script's exit code alone
 is not proof of task correctness: inspect output/files. Stop and explain blockers.
 Do not create background processes. Keep tasks short and within the workspace.
+Only report file contents after a successful read_file tool result. Do not invent tool results.
 '''
 
 
 def safe_print(value):
-    # Escape terminal control sequences from model/file output.
     text = str(value)
     print(''.join(c if c in '\n\t' or (ord(c) >= 32 and ord(c) != 127 and not 128 <= ord(c) <= 159)
                   else repr(c)[1:-1] for c in text))
@@ -37,55 +37,74 @@ def approval(name, details):
         return False
 
 
+def api_key():
+    return os.environ.get('YOU_API_KEY') or os.environ.get('VYCEAI_API_KEY') or os.environ.get('GEMINI_API_KEY', '')
+
+
+def parse_tool_arguments(raw):
+    if raw in (None, ''):
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if not isinstance(raw, str):
+        raise ValueError('Tool arguments must be a JSON object.')
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise ValueError('Tool arguments must be a JSON object.')
+    return parsed
+
+
 def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=180):
     if not goal.strip() or len(goal) > 16000:
         raise ValueError('Goal must be between 1 and 16000 characters.')
     if min(max_steps, max_tokens, max_seconds) <= 0:
         raise ValueError('All limits must be positive.')
-    contents = [{'role': 'user', 'parts': [{'text': goal}]}]
+    messages = [{'role': 'user', 'content': goal}]
     started = time.monotonic()
     total = 0
+    openai_tools = tools.openai_tools if hasattr(tools, 'openai_tools') else None
     for step in range(max_steps):
         if time.monotonic() - started >= max_seconds:
             return {'status': 'limit_reached', 'reason': 'Runtime limit', 'tokens': total}
-        content, usage = provider.generate(contents, SYSTEM, tools.declarations)
+        message, usage = provider.generate(messages, SYSTEM, openai_tools)
         total += int(usage.get('totalTokenCount', 0))
-        # Keep original model content, including opaque thought signatures.
-        contents.append(content)
+        messages.append(message)
         if total >= max_tokens:
             return {'status': 'limit_reached', 'reason': 'Token usage threshold', 'tokens': total}
-        responses = []
-        for part in content['parts']:
+        calls = message.get('tool_calls') or []
+        if not calls:
+            text = (message.get('content') or '').strip()
+            if not text:
+                raise ProviderError('Model returned neither visible text nor tool calls.')
+            return {'status': 'answered', 'text': tools.redact(text), 'tokens': total, 'steps': step + 1}
+        if len(calls) > 4:
+            return {'status': 'limit_reached', 'reason': 'Too many tool calls in one response', 'tokens': total}
+        for call in calls:
             if time.monotonic() - started >= max_seconds:
                 return {'status': 'limit_reached', 'reason': 'Runtime limit', 'tokens': total}
-            if 'functionCall' not in part:
-                continue
-            if len(responses) >= 4:
-                return {'status': 'limit_reached', 'reason': 'Too many tool calls in one response', 'tokens': total}
-            call = part['functionCall']
-            name = call.get('name', '')
-            result = tools.execute(name, call.get('args', {}))
+            function = call.get('function') or {}
+            name = function.get('name', '')
+            try:
+                args = parse_tool_arguments(function.get('arguments'))
+                result = tools.execute(name, args)
+            except (ValueError, TypeError, json.JSONDecodeError) as exc:
+                result = {'ok': False, 'error': str(exc)[:1000]}
             safe_print('Tool ' + name + ': ' + ('ok' if result.get('ok') else 'failed/denied'))
-            response = {'name': name, 'response': result}
-            if 'id' in call:
-                response['id'] = call['id']
-            responses.append({'functionResponse': response})
-        if not responses:
-            text = '\n'.join(p['text'] for p in content['parts'] if 'text' in p and not p.get('thought'))
-            if not text:
-                raise ProviderError('Gemini returned neither visible text nor tool calls.')
-            # Model completion is not an independent proof that the task succeeded.
-            return {'status': 'answered', 'text': tools.redact(text), 'tokens': total, 'steps': step + 1}
-        contents.append({'role': 'user', 'parts': responses})
+            messages.append({
+                'role': 'tool',
+                'tool_call_id': call.get('id') or name,
+                'content': json.dumps(result, ensure_ascii=True),
+            })
     return {'status': 'limit_reached', 'reason': 'Maximum agent steps', 'tokens': total}
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='You: approval-controlled Gemini agent for Termux')
+    parser = argparse.ArgumentParser(description='You: approval-controlled Termux agent (VyceAI / DeepSeek)')
     parser.add_argument('--workspace', default=os.environ.get('YOU_WORKSPACE', str(Path.home() / '.local/share/you/workspace')))
-    parser.add_argument('--model', default=os.environ.get('YOU_MODEL', 'gemini-3.6-flash'))
+    parser.add_argument('--model', default=os.environ.get('YOU_MODEL', 'deepseek-v4-flash'))
+    parser.add_argument('--api-base', default=os.environ.get('YOU_API_BASE', 'https://vyceai.com/v1'))
     commands = parser.add_subparsers(dest='command', required=True)
-    doctor = commands.add_parser('doctor', help='Check local configuration; --online tests Gemini')
+    doctor = commands.add_parser('doctor', help='Check local configuration; --online tests the API')
     doctor.add_argument('--online', action='store_true')
     chat = commands.add_parser('chat', help='One-shot chat without tools')
     chat.add_argument('prompt')
@@ -96,7 +115,7 @@ def main(argv=None):
     run.add_argument('--max-tokens', type=int, default=24000)
     run.add_argument('--max-seconds', type=int, default=180)
     args = parser.parse_args(argv)
-    key = os.environ.get('GEMINI_API_KEY', '')
+    key = api_key()
     try:
         if args.command == 'doctor':
             root = Path(args.workspace).expanduser()
@@ -106,22 +125,24 @@ def main(argv=None):
                 test.write(b'workspace test')
             safe_print('Python: ' + sys.version.split()[0])
             safe_print('Workspace: ' + str(root.resolve()))
+            safe_print('API base: ' + args.api_base)
             safe_print('Model: ' + args.model)
-            safe_print('API key: ' + ('configured (hidden)' if key else 'missing'))
+            safe_print('API key: ' + ('configured (hidden)' if key else 'missing (set YOU_API_KEY)'))
             safe_print('Android/Termux: ' + ('detected' if 'com.termux' in sys.executable else 'not detected; phone compatibility unverified'))
             if args.online:
-                Gemini(key, args.model).generate([{'role': 'user', 'parts': [{'text': 'Reply OK.'}]}], SYSTEM)
-                safe_print('Gemini online check: passed')
+                Provider(key, args.model, args.api_base).generate(
+                    [{'role': 'user', 'content': 'Reply OK.'}], SYSTEM)
+                safe_print('Online check: passed')
             else:
                 safe_print('Network/model access: not tested; use doctor --online (uses API quota).')
             return 0 if key else 1
-        provider = Gemini(key, args.model)
+        provider = Provider(key, args.model, args.api_base)
         if args.command == 'chat':
             if not args.prompt.strip() or len(args.prompt) > 16000:
                 raise ValueError('Prompt must be between 1 and 16000 characters.')
-            content, _ = provider.generate([{'role': 'user', 'parts': [{'text': args.prompt}]}], SYSTEM)
-            text = '\n'.join(p['text'] for p in content['parts'] if 'text' in p and not p.get('thought'))
-            safe_print(text.replace(key, '[REDACTED]'))
+            message, _ = provider.generate([{'role': 'user', 'content': args.prompt}], SYSTEM)
+            text = (message.get('content') or '')
+            safe_print(text.replace(key, '[REDACTED]') if key else text)
             return 0
         tools = Tools(args.workspace, approval, args.allow_python, key)
         result = run_agent(provider, tools, args.goal, args.max_steps, args.max_tokens, args.max_seconds)
@@ -132,7 +153,7 @@ def main(argv=None):
         safe_print('Cancelled.')
         return 130
     except (ProviderError, OSError, ValueError) as exc:
-        safe_print('Error: ' + str(exc).replace(key, '[REDACTED]') if key else 'Error: ' + str(exc))
+        safe_print('Error: ' + (str(exc).replace(key, '[REDACTED]') if key else str(exc)))
         return 1
 
 

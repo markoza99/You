@@ -41,6 +41,25 @@ class Tools:
     def declarations(self):
         return [d for d in DECLARATIONS if self.allow_python or d['name'] != 'run_python']
 
+    @property
+    def openai_tools(self):
+        converted = []
+        for item in self.declarations:
+            parameters = json.loads(json.dumps(item['parameters']))
+            parameters['type'] = 'object'
+            for prop in parameters.get('properties', {}).values():
+                if isinstance(prop, dict) and prop.get('type') == 'STRING':
+                    prop['type'] = 'string'
+            converted.append({
+                'type': 'function',
+                'function': {
+                    'name': item['name'],
+                    'description': item['description'],
+                    'parameters': parameters,
+                },
+            })
+        return converted
+
     def redact(self, value):
         return value.replace(self.secret, "[REDACTED]") if self.secret else value
 

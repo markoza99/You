@@ -1,4 +1,4 @@
-"""Small standard-library REST adapter; no native package dependencies."""
+"""OpenAI-compatible REST adapter (VyceAI / DeepSeek). No native package dependencies."""
 import json
 import re
 import urllib.error
@@ -9,23 +9,34 @@ class ProviderError(RuntimeError):
     pass
 
 
-class Gemini:
-    def __init__(self, key, model="gemini-3.6-flash", timeout=45):
+class Provider:
+    def __init__(self, key, model="deepseek-v4-flash", base="https://vyceai.com/v1", timeout=90):
         if not key:
-            raise ProviderError("GEMINI_API_KEY is missing. Set it locally in your shell.")
-        if not re.fullmatch(r"[a-zA-Z0-9._-]+", model):
+            raise ProviderError("YOU_API_KEY is missing. Set it locally in your shell.")
+        if not re.fullmatch(r"[a-zA-Z0-9._:/-]+", model):
             raise ProviderError("Invalid model ID.")
-        self.key, self.model, self.timeout = key, model, timeout
+        base = (base or "").rstrip("/")
+        if not (base.startswith("https://") and " " not in base):
+            raise ProviderError("YOU_API_BASE must be an https URL.")
+        self.key, self.model, self.base, self.timeout = key, model, base, timeout
 
-    def generate(self, contents, system, tools=None):
-        body = {"contents": contents, "systemInstruction": {"parts": [{"text": system}]},
-                "generationConfig": {"maxOutputTokens": 4096}}
+    def generate(self, messages, system, tools=None):
+        body = {
+            "model": self.model,
+            "messages": [{"role": "system", "content": system}] + list(messages),
+            "max_tokens": 4096,
+        }
         if tools:
-            body["tools"] = [{"functionDeclarations": tools}]
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
         req = urllib.request.Request(
-            "https://generativelanguage.googleapis.com/v1beta/models/" + self.model + ":generateContent",
+            self.base + "/chat/completions",
             data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json", "x-goog-api-key": self.key})
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + self.key,
+            },
+        )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 raw = response.read(2_000_001)
@@ -33,19 +44,34 @@ class Gemini:
                 raise ProviderError("API response exceeded size limit.")
             data = json.loads(raw)
         except urllib.error.HTTPError as exc:
-            messages = {400: "Invalid request or unsupported model feature.",
-                        401: "Authentication failed.", 403: "API key or model access denied.",
-                        404: "Model unavailable; check YOU_MODEL and account access.",
-                        429: "Quota/rate limit reached; wait or check billing."}
-            raise ProviderError(messages.get(exc.code, "Gemini service error (HTTP %s)." % exc.code)) from None
+            messages_map = {
+                400: "Invalid request or unsupported model feature.",
+                401: "Authentication failed.",
+                403: "API key or model access denied.",
+                404: "Model or endpoint unavailable; check YOU_MODEL and YOU_API_BASE.",
+                429: "Rate limit (HTTP 429). Wait and retry. This is not necessarily a billing failure.",
+            }
+            raise ProviderError(messages_map.get(exc.code, "API service error (HTTP %s)." % exc.code)) from None
         except (urllib.error.URLError, TimeoutError, OSError):
             raise ProviderError("Network request failed or timed out; no tool was retried.") from None
         except (ValueError, TypeError):
-            raise ProviderError("Invalid JSON response from Gemini.") from None
-        candidates = data.get("candidates", [])
-        if not candidates or not candidates[0].get("content", {}).get("parts"):
-            raise ProviderError("Gemini returned no usable content (possibly blocked).")
-        if candidates[0].get("finishReason") not in (None, "STOP"):
-            raise ProviderError("Gemini response was incomplete; refusing partial tool calls.")
-        # Return original content so thought signatures and function IDs survive round trips.
-        return candidates[0]["content"], data.get("usageMetadata", {})
+            raise ProviderError("Invalid JSON response from the API.") from None
+        choices = data.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            raise ProviderError("API returned no usable choices.")
+        message = choices[0].get("message")
+        if not isinstance(message, dict) or message.get("role") not in (None, "assistant"):
+            raise ProviderError("API returned no usable assistant message.")
+        finish = choices[0].get("finish_reason")
+        tool_calls = message.get("tool_calls") or []
+        if finish not in (None, "stop", "tool_calls"):
+            raise ProviderError("API response was incomplete; refusing partial tool calls.")
+        if not tool_calls and not (message.get("content") or "").strip():
+            raise ProviderError("API returned neither visible text nor tool calls.")
+        usage = data.get("usage") or {}
+        total = usage.get("total_tokens", 0)
+        return message, {"totalTokenCount": int(total or 0), "usage": usage}
+
+
+# Backward-compatible name used by older tests/docs.
+Gemini = Provider

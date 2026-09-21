@@ -38,9 +38,12 @@ read -r -s -p 'VyceAI API key: ' YOU_API_KEY; echo
 export YOU_API_KEY
 export YOU_API_BASE=https://vyceai.com/v1
 export YOU_MODEL=deepseek-v4-flash
+you save-key
 you doctor
 you doctor --online
 ```
+
+`you save-key` writes the key to `~/.local/share/you/credentials.json` (mode 600). Later Termux sessions can run `you` without exporting the key again. Do not copy that file or paste keys into chat.
 
 `.env.example` is documentation only; `.env` files are **not automatically loaded**. The variable lasts for the shell session. `doctor --online` sends a small API request.
 
@@ -65,7 +68,8 @@ Approved Python is **not sandboxed**. Read the displayed code before typing `yes
 
 ## Limits
 
-- Tools: `list_files`, `read_file`, `write_file`; opt-in `run_python`.
+- Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`; opt-in `run_python`.
+- For LAN IP / nearby devices, the agent should use `local_ipv4` and `ssdp_discover` instead of writing scan scripts. SSDP still misses silent TVs.
 - Default: 8 model turns, at most 4 tool calls per turn.
 - API timeout: 90 seconds. HTTP 429 means rate limit; wait and retry. That is not automatically a billing failure.
 - `answered` means the model produced a final response, not independently certified success.

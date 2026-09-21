@@ -1,5 +1,6 @@
 import io
 import json
+import socket
 import sys
 from urllib.error import HTTPError
 
@@ -41,6 +42,48 @@ def test_write_denied(tools):
     ('write_file', {'path': 'a', 'content': 'x' * (LIMIT + 1)}), ('run_python', {'path': 'a.py'})])
 def test_invalid_tool_calls(tools, name, args):
     assert not tools.execute(name, args)['ok']
+
+
+def test_local_ipv4_rejects_loopback(monkeypatch, tools):
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('127.0.0.1', 1)
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    result = tools.execute('local_ipv4', {})
+    assert not result['ok']
+
+
+def test_ssdp_same_subnet_only(monkeypatch, tools):
+    class FakeSock:
+        def __init__(self):
+            self.sent = False
+        def settimeout(self, *_):
+            pass
+        def setsockopt(self, *a, **k):
+            pass
+        def bind(self, addr):
+            pass
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def sendto(self, data, dest):
+            self.sent = True
+        def recvfrom(self, n):
+            raise socket.timeout()
+        def close(self):
+            pass
+    import socket as sockmod
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    monkeypatch.setattr('you_agent.tools.socket.timeout', sockmod.timeout)
+    result = tools.execute('ssdp_discover', {})
+    assert result['ok']
+    assert result['phone_ip'] == '192.168.1.78'
+    assert result['devices'] == []
 
 
 def test_redaction(tools):

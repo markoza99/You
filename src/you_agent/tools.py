@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import selectors
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -25,6 +26,8 @@ DECLARATIONS = [
                 {"path": TEXT, "content": TEXT}, ["path", "content"]),
     declaration("run_python", "Run a workspace Python script after explicit approval. NOT sandboxed.",
                 {"path": TEXT}, ["path"]),
+    declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
+    declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
 ]
 
 
@@ -89,6 +92,10 @@ class Tools:
                 raise ValueError("Tool arguments do not match the schema.")
             if any(not isinstance(v, str) for v in args.values()):
                 raise ValueError("Tool arguments must be strings.")
+            if name == 'local_ipv4':
+                return self.local_ipv4()
+            if name == 'ssdp_discover':
+                return self.ssdp_discover()
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])
@@ -134,6 +141,74 @@ class Tools:
             return self.run_python(path)
         except (OSError, ValueError, UnicodeError) as exc:
             return {"ok": False, "error": self.redact(str(exc))[:1000]}
+
+    def local_ipv4(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(('1.1.1.1', 80))
+            ip = sock.getsockname()[0]
+        finally:
+            sock.close()
+        if not ip or ip.startswith('127.') or ip in ('0.0.0.0', '::'):
+            return {"ok": False, "error": "Could not detect a non-loopback IPv4 address."}
+        subnet = '.'.join(ip.split('.')[:3]) + '.0/24'
+        return {"ok": True, "ip": ip, "subnet": subnet,
+                "note": "LAN address used to reach the internet, not a public IP."}
+
+    def ssdp_discover(self):
+        info = self.local_ipv4()
+        if not info.get('ok'):
+            return info
+        local_ip = info['ip']
+        prefix = '.'.join(local_ip.split('.')[:3]) + '.'
+        message = (
+            'M-SEARCH * HTTP/1.1\r\n'
+            'HOST: 239.255.255.250:1900\r\n'
+            'MAN: "ssdp:discover"\r\n'
+            'MX: 2\r\n'
+            'ST: ssdp:all\r\n'
+            '\r\n'
+        )
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.settimeout(0.4)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            try:
+                sock.bind((local_ip, 0))
+            except OSError:
+                sock.bind(('', 0))
+            sock.sendto(message.encode(), ('239.255.255.250', 1900))
+            found = {}
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    data, addr = sock.recvfrom(65507)
+                except socket.timeout:
+                    continue
+                ip = addr[0]
+                if not ip.startswith(prefix) or ip == local_ip:
+                    continue
+                headers = {}
+                for line in data.decode('utf-8', errors='replace').splitlines():
+                    if ':' in line:
+                        key, _, value = line.partition(':')
+                        headers[key.strip().lower()] = value.strip()
+                found[ip] = {
+                    "ip": ip,
+                    "server": headers.get('server', ''),
+                    "st": headers.get('st', ''),
+                    "usn": headers.get('usn', ''),
+                }
+        finally:
+            sock.close()
+        return {
+            "ok": True,
+            "phone_ip": local_ip,
+            "subnet": info['subnet'],
+            "devices": list(found.values()),
+            "count": len(found),
+            "note": "SSDP only lists devices that answer multicast. A silent Android TV often will not appear. Use the TV network page or router DHCP list.",
+        }
 
     def run_python(self, path):
         # Minimal inherited environment; never pass API keys to the child.

@@ -17,6 +17,8 @@ Do not claim actions happened without successful tool results. A script's exit c
 is not proof of task correctness: inspect output/files. Stop and explain blockers.
 Do not create background processes. Keep tasks short and within the workspace.
 Only report file contents after a successful read_file tool result. Do not invent tool results.
+For this phone LAN IP or nearby devices, call local_ipv4 and ssdp_discover. Do not write scan scripts unless those tools fail.
+Do not treat 0.0.0.0 or 127.0.0.1 as the phone address.
 '''
 
 
@@ -43,8 +45,35 @@ def auto_approval(name, details):
     return True
 
 
+CONFIG_DIR = Path.home() / '.local/share/you'
+CREDENTIALS_PATH = CONFIG_DIR / 'credentials.json'
+
+
+def load_saved_config():
+    try:
+        data = json.loads(CREDENTIALS_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_credentials(key, base, model):
+    CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    payload = {'YOU_API_KEY': key, 'YOU_API_BASE': base, 'YOU_MODEL': model}
+    tmp = CREDENTIALS_PATH.with_suffix('.json.tmp')
+    tmp.write_text(json.dumps(payload))
+    tmp.chmod(0o600)
+    tmp.replace(CREDENTIALS_PATH)
+    return CREDENTIALS_PATH
+
+
 def api_key():
-    return os.environ.get('YOU_API_KEY') or os.environ.get('VYCEAI_API_KEY') or os.environ.get('GEMINI_API_KEY', '')
+    saved = load_saved_config()
+    return (os.environ.get('YOU_API_KEY')
+            or os.environ.get('VYCEAI_API_KEY')
+            or os.environ.get('GEMINI_API_KEY')
+            or saved.get('YOU_API_KEY')
+            or '')
 
 
 def parse_tool_arguments(raw):
@@ -99,6 +128,8 @@ def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=
             extra = ''
             if name == 'run_python' and result.get('output'):
                 extra = '\n' + result['output'][:2000]
+            elif name in ('local_ipv4', 'ssdp_discover') and result.get('ok'):
+                extra = '\n' + json.dumps(result, ensure_ascii=True)[:2000]
             elif not result.get('ok') and result.get('error'):
                 extra = ' (' + str(result['error'])[:200] + ')'
             safe_print('Tool ' + name + ': ' + status + extra)
@@ -112,12 +143,14 @@ def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='You: approval-controlled Termux agent (VyceAI / DeepSeek)')
+    saved = load_saved_config()
     parser.add_argument('--workspace', default=os.environ.get('YOU_WORKSPACE', str(Path.home() / '.local/share/you/workspace')))
-    parser.add_argument('--model', default=os.environ.get('YOU_MODEL', 'deepseek-v4-flash'))
-    parser.add_argument('--api-base', default=os.environ.get('YOU_API_BASE', 'https://vyceai.com/v1'))
+    parser.add_argument('--model', default=os.environ.get('YOU_MODEL') or saved.get('YOU_MODEL') or 'deepseek-v4-flash')
+    parser.add_argument('--api-base', default=os.environ.get('YOU_API_BASE') or saved.get('YOU_API_BASE') or 'https://vyceai.com/v1')
     commands = parser.add_subparsers(dest='command', required=True)
     doctor = commands.add_parser('doctor', help='Check local configuration; --online tests the API')
     doctor.add_argument('--online', action='store_true')
+    savekey = commands.add_parser('save-key', help='Save YOU_API_KEY from the environment into a private local file')
     chat = commands.add_parser('chat', help='One-shot chat without tools')
     chat.add_argument('prompt')
     run = commands.add_parser('run', help='Run a bounded goal with workspace tools')
@@ -149,6 +182,13 @@ def main(argv=None):
             else:
                 safe_print('Network/model access: not tested; use doctor --online (uses API quota).')
             return 0 if key else 1
+        if args.command == 'save-key':
+            if not key:
+                raise ValueError('Set YOU_API_KEY in this shell first, then run: you save-key')
+            path = save_credentials(key, args.api_base, args.model)
+            safe_print('Saved API settings privately to ' + str(path))
+            safe_print('Do not copy this file. Later shells can run you without exporting the key.')
+            return 0
         provider = Provider(key, args.model, args.api_base)
         if args.command == 'chat':
             if not args.prompt.strip() or len(args.prompt) > 16000:

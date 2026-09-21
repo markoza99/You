@@ -406,6 +406,56 @@ def test_child_env_used_by_subprocess(tools):
         os.environ.pop('YOU_TEST_MARKER', None)
 
 
+def test_check_command_reports_presence(monkeypatch, tools):
+    monkeypatch.setattr('you_agent.tools.shutil.which',
+                        lambda name: '/bin/ping' if name == 'ping' else None)
+    found = tools.execute('check_command', {'name': 'ping'})
+    assert found['ok'] and found['installed'] is True and found['path'] == '/bin/ping'
+    missing = tools.execute('check_command', {'name': 'nmap'})
+    assert missing['ok'] and missing['installed'] is False
+
+
+@pytest.mark.parametrize('name', ['bad;name', 'rm -rf', '', 'x' * 61])
+def test_check_command_rejects_junk(tools, name):
+    assert not tools.execute('check_command', {'name': name})['ok']
+
+
+@pytest.mark.parametrize('package', ['Nmap', 'pkg;rm', '-evil', 'a b'])
+def test_pkg_install_rejects_bad_names(tools, package):
+    assert not tools.execute('pkg_install', {'package': package})['ok']
+
+
+def test_pkg_install_denied_does_not_run(monkeypatch, tools):
+    tools.approve = lambda *_: False
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/bin/' + name)
+    monkeypatch.setattr(Tools, '_run_process',
+                        lambda self, argv, timeout=None: pytest.fail('must not install when denied'))
+    result = tools.execute('pkg_install', {'package': 'nmap'})
+    assert not result['ok'] and 'denied' in result['error'].lower()
+
+
+def test_pkg_install_uses_longer_timeout(monkeypatch, tools):
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/bin/' + name)
+    seen = {}
+    def fake(self, argv, timeout=None):
+        seen['argv'] = argv
+        seen['timeout'] = timeout
+        return {'ok': True, 'exit_code': 0, 'output': 'done', 'error': None, 'truncated': False}
+    monkeypatch.setattr(Tools, '_run_process', fake)
+    result = tools.execute('pkg_install', {'package': 'nmap'})
+    assert result['ok'] is True
+    assert seen['argv'] == ['pkg', 'install', '-y', 'nmap']
+    # Installs must not inherit run_shell's short timeout.
+    assert seen['timeout'] == tools.install_timeout > tools.timeout
+
+
+def test_run_process_timeout_override(tools):
+    tools.allow_python = True
+    tools.timeout = 30
+    slow = tools._run_process(['/bin/sh', '-c', 'sleep 5'], timeout=0.2)
+    assert not slow['ok'] and 'timed out' in slow['error']
+
+
 def test_open_url_detects_blocked_am(monkeypatch, tools):
     tools.allow_python = True
     monkeypatch.setattr('you_agent.tools.shutil.which',

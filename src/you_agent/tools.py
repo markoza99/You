@@ -35,6 +35,10 @@ DECLARATIONS = [
     declaration("open_url", "Open an http(s) URL on this phone. Tries termux-open-url then am start. Requires approval. Exit code 0 does NOT prove the browser opened.",
                 {"url": TEXT}, ["url"]),
     declaration("android_check", "Read-only Android/Termux diagnostic: which termux packages and CLIs exist, Android version. Use when a phone action silently does nothing.", {}, []),
+    declaration("check_command", "Read-only: is a command installed in Termux? Returns its path or null. Call this before installing anything.",
+                {"name": TEXT}, ["name"]),
+    declaration("pkg_install", "Install one Termux package with pkg. Use it yourself when a command you need is missing. Requires approval. Longer timeout than run_shell.",
+                {"package": TEXT}, ["package"]),
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
@@ -50,13 +54,15 @@ DECLARATIONS = [
 
 
 class Tools:
-    def __init__(self, workspace, approve, allow_python=False, secret="", timeout=15):
+    def __init__(self, workspace, approve, allow_python=False, secret="", timeout=15,
+                 install_timeout=300):
         self.root = Path(workspace).expanduser().resolve()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.approve = approve
         self.allow_python = allow_python
         self.secret = secret
         self.timeout = timeout
+        self.install_timeout = install_timeout
 
     @property
     def declarations(self):
@@ -149,6 +155,10 @@ class Tools:
                 return self.open_url(args['url'])
             if name == 'android_check':
                 return self.android_check()
+            if name == 'check_command':
+                return self.check_command(args['name'])
+            if name == 'pkg_install':
+                return self.pkg_install(args['package'])
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])
@@ -496,6 +506,48 @@ class Tools:
                     'the user an app is missing based only on an empty package list.',
         }
 
+    def check_command(self, name):
+        name = name.strip()
+        if not re.fullmatch(r'[A-Za-z0-9._+-]{1,60}', name):
+            raise ValueError('Invalid command name.')
+        path = shutil.which(name)
+        return {
+            'ok': True,
+            'name': name,
+            'installed': bool(path),
+            'path': path,
+            'note': 'If installed is false, install it yourself with pkg_install instead of '
+                    'asking the user. The Termux package name is not always the command name.',
+        }
+
+    def pkg_install(self, package):
+        package = package.strip()
+        if not re.fullmatch(r'[a-z0-9][a-z0-9._+-]{0,60}', package):
+            raise ValueError('Invalid Termux package name.')
+        if not shutil.which('pkg'):
+            return {'ok': False, 'package': package,
+                    'error': 'pkg is not available; this does not look like Termux.'}
+        details = {
+            'package': package,
+            'command': 'pkg install -y ' + package,
+            'timeout_seconds': self.install_timeout,
+            'warning': 'Installs software on this phone as your Termux user.',
+        }
+        if not self.approve('pkg_install', details):
+            return {'ok': False, 'package': package, 'error': 'User denied package install.'}
+        result = self._run_process(['pkg', 'install', '-y', package],
+                                   timeout=self.install_timeout)
+        output = result.get('output', '')
+        return {
+            'ok': result['ok'],
+            'package': package,
+            'exit_code': result['exit_code'],
+            'output': output[-2000:],
+            'error': result.get('error'),
+            'note': 'Verify with check_command afterwards: a package can install while the '
+                    'command you wanted has a different name.',
+        }
+
     def run_shell(self, command):
         command = command.strip()
         if not command:
@@ -543,7 +595,8 @@ class Tools:
                     env.pop(name, None)
         return env
 
-    def _run_process(self, argv):
+    def _run_process(self, argv, timeout=None):
+        limit = self.timeout if timeout is None else timeout
         env = self._child_env()
         process = subprocess.Popen(argv, cwd=self.root,
                                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -555,7 +608,7 @@ class Tools:
         selector.register(process.stdout, selectors.EVENT_READ)
         try:
             while selector.get_map():
-                if time.monotonic() - start > self.timeout:
+                if time.monotonic() - start > limit:
                     reason = 'Execution timed out.'
                     break
                 for key, _ in selector.select(timeout=0.1):
@@ -571,7 +624,7 @@ class Tools:
                     break
             if reason is None:
                 try:
-                    process.wait(timeout=max(0.01, self.timeout - (time.monotonic() - start)))
+                    process.wait(timeout=max(0.01, limit - (time.monotonic() - start)))
                 except subprocess.TimeoutExpired:
                     reason = 'Execution timed out.'
         finally:

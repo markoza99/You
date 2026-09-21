@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import selectors
+import shutil
 import signal
 import socket
 import subprocess
@@ -31,6 +32,8 @@ DECLARATIONS = [
                 {"path": TEXT}, ["path"]),
     declaration("run_shell", "Run one shell command in Termux after explicit approval. Use for am, termux-open-url, pkg, ls, ping. NOT sandboxed.",
                 {"command": TEXT}, ["command"]),
+    declaration("open_url", "Open an http(s) URL on this phone. Tries termux-open-url then am start. Requires approval. Exit code 0 does NOT prove the browser opened.",
+                {"url": TEXT}, ["url"]),
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
@@ -135,6 +138,8 @@ class Tools:
                 return {'ok': True, 'key': key, 'value': value}
             if name == 'run_shell':
                 return self.run_shell(args['command'])
+            if name == 'open_url':
+                return self.open_url(args['url'])
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])
@@ -366,6 +371,59 @@ class Tools:
         r'chmod\s+-R\s+777\s+/\s*($|;|&)',
     )
 
+    def open_url(self, url):
+        url = url.strip()
+        if not re.fullmatch(r'https?://[^\s<>"\'\\]{1,2000}', url):
+            raise ValueError('url must be a single http:// or https:// address.')
+        available = {
+            'termux-open-url': bool(shutil.which('termux-open-url')),
+            'am': bool(shutil.which('am')),
+        }
+        if not any(available.values()):
+            return {
+                'ok': False,
+                'url': url,
+                'available': available,
+                'error': 'Neither termux-open-url nor am is installed.',
+                'hint': 'Install the Termux:API app from the same store as Termux, then: pkg install termux-api',
+            }
+        details = {
+            'url': url,
+            'available': available,
+            'plan': 'Try termux-open-url, then am start, until one exits 0.',
+            'warning': 'NOT SANDBOXED: launches an Android intent as your Termux user.',
+        }
+        if not self.approve('open_url', details):
+            return {'ok': False, 'url': url, 'error': 'User denied opening the URL.'}
+        attempts = []
+        succeeded = False
+        if available['termux-open-url']:
+            result = self._run_process(['termux-open-url', url])
+            attempts.append({'method': 'termux-open-url', 'exit_code': result['exit_code'],
+                             'output': result['output'][:500], 'error': result['error']})
+            succeeded = result['ok']
+        if not succeeded and available['am']:
+            result = self._run_process(
+                ['am', 'start', '-a', 'android.intent.action.VIEW', '-d', url])
+            output = result['output']
+            # am prints "Error: Activity not started" while still exiting 0 on some ROMs.
+            blocked = 'error' in output.lower() or 'not started' in output.lower()
+            attempts.append({'method': 'am start', 'exit_code': result['exit_code'],
+                             'output': output[:500], 'error': result['error'],
+                             'reported_error_text': blocked})
+            succeeded = result['ok'] and not blocked
+        return {
+            'ok': succeeded,
+            'url': url,
+            'available': available,
+            'attempts': attempts,
+            'verified': False,
+            'note': ('A zero exit code only means the command ran. Android 11+ silently blocks '
+                     'activity starts from Termux unless Termux is in the foreground or has the '
+                     '"Draw over other apps" permission. Tell the user to look at the screen and '
+                     'confirm; do not claim the browser opened.'),
+        }
+
     def run_shell(self, command):
         command = command.strip()
         if not command:
@@ -390,6 +448,10 @@ class Tools:
             return {'ok': False, 'error': 'User denied shell execution.', 'command': command}
         result = self._run_process(['/bin/sh', '-c', command])
         result['command'] = command
+        if result['ok'] and not result['output'].strip():
+            result['note'] = ('Exit code 0 with no output. The command ran, but this is NOT '
+                              'evidence that any on-screen effect happened. Do not claim success; '
+                              'ask the user to confirm, or verify with another command.')
         return result
 
     def run_python(self, path):

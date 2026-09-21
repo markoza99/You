@@ -27,9 +27,11 @@ How to work:
 - Tool JSON is the only evidence. Quote it. Never invent hosts, files, or HTTP success.
 - Writes, run_python, run_shell, and dial_launch need user approval. If the user denies, stop.
   Do not retry a denied action or work around the denial.
-- Android: Termux cannot tap other apps. To open a URL on this phone try
-  termux-open-url, then am start -a android.intent.action.VIEW -d <url>.
-  If both fail, say so plainly instead of claiming it opened.
+- Android: Termux cannot tap other apps. To open a URL on this phone, call open_url.
+  Exit code 0 is NOT proof that anything appeared on screen. Android 11+ silently blocks
+  activity starts from Termux unless Termux is in the foreground or has "Draw over other apps".
+  After open_url, say the command was accepted and ask the user to look at the screen.
+  Never write "Success", "It is now open", or a checkmark for an on-screen action you cannot see.
 - Do not scan the internet or other subnets. LAN tools stay on this phone /24.
 - 0.0.0.0 and 127.0.0.1 are not the phone address.
 - TV / Cast: ssdp_discover or remembered tv_ip, then dial_inspect, then dial_launch only if youtube_dial_available is true. A YouTube home-screen icon is not DIAL. HTTP 404 means DIAL YouTube is not exposed; say that and stop.
@@ -153,7 +155,7 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds
             extra = ''
             if name in ('run_python', 'run_shell') and result.get('output'):
                 extra = '\n' + result['output'][:2000]
-            elif name in ('local_ipv4', 'ssdp_discover', 'dial_inspect', 'dial_launch', 'think', 'memory_get', 'memory_set'):
+            elif name in ('local_ipv4', 'ssdp_discover', 'dial_inspect', 'dial_launch', 'think', 'memory_get', 'memory_set', 'open_url'):
                 extra = '\n' + json.dumps(result, ensure_ascii=True)[:2000]
             elif not result.get('ok') and result.get('error'):
                 extra = ' (' + str(result['error'])[:200] + ')'

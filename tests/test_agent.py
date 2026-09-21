@@ -274,6 +274,64 @@ def test_shell_timeout(tools):
     assert not result['ok'] and 'timed out' in result['error']
 
 
+@pytest.mark.parametrize('url', ['ftp://x.com', 'javascript:alert(1)', 'youtube.com',
+                                 'https://a b.com', 'https://x.com\nrm -rf'])
+def test_open_url_rejects_bad_url(tools, url):
+    tools.allow_python = True
+    assert not tools.execute('open_url', {'url': url})['ok']
+
+
+def test_open_url_without_helpers(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: None)
+    result = tools.execute('open_url', {'url': 'https://youtube.com'})
+    assert not result['ok']
+    assert 'termux-api' in result['hint']
+
+
+def test_open_url_denied_does_not_run(monkeypatch, tools):
+    tools.allow_python = True
+    tools.approve = lambda *_: False
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/usr/bin/' + name)
+    monkeypatch.setattr(Tools, '_run_process',
+                        lambda self, argv: pytest.fail('must not run when denied'))
+    result = tools.execute('open_url', {'url': 'https://youtube.com'})
+    assert not result['ok'] and 'denied' in result['error'].lower()
+
+
+def test_open_url_never_claims_verified(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which',
+                        lambda name: '/usr/bin/termux-open-url' if name == 'termux-open-url' else None)
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv: {
+        'ok': True, 'exit_code': 0, 'output': '', 'error': None, 'truncated': False})
+    result = tools.execute('open_url', {'url': 'https://youtube.com'})
+    assert result['ok'] is True
+    assert result['verified'] is False
+    assert 'Draw over other apps' in result['note']
+    assert result['attempts'][0]['method'] == 'termux-open-url'
+
+
+def test_open_url_detects_blocked_am(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which',
+                        lambda name: '/system/bin/am' if name == 'am' else None)
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv: {
+        'ok': True, 'exit_code': 0,
+        'output': 'Error: Activity not started, unable to resolve Intent',
+        'error': None, 'truncated': False})
+    result = tools.execute('open_url', {'url': 'https://youtube.com'})
+    assert result['ok'] is False
+    assert result['attempts'][0]['reported_error_text'] is True
+
+
+def test_shell_silent_success_gets_warning_note(tools):
+    tools.allow_python = True
+    result = tools.execute('run_shell', {'command': 'true'})
+    assert result['ok'] and not result['output'].strip()
+    assert 'NOT' in result['note'] and 'evidence' in result['note']
+
+
 def test_changed_after_approval(tools):
     tools.allow_python = True
     (tools.root / 'a.py').write_text('print(1)')

@@ -70,12 +70,17 @@ you run --allow-python 'Open youtube.com in the phone browser.'
 
 Approved Python and shell are **not sandboxed**. Read the displayed code or command before typing `yes`.
 
-Opening a URL needs Termux:API (`pkg install termux-api` plus the Termux:API app from the same store as Termux). Without it, `termux-open-url` is missing and the agent will fall back to `am start`; if that is also blocked it will say so instead of claiming success.
+Opening a URL needs Termux:API (`pkg install termux-api` plus the Termux:API app from the same store as Termux).
+
+**Android blocks this by default.** On Android 11+ an app cannot start an activity unless it is in the foreground or holds **Draw over other apps**. `am start` and `termux-open-url` then exit 0 and do nothing. Grant Termux *Settings → Apps → Termux → Display over other apps*.
+
+Because of that, `open_url` always returns `verified: false`. A zero exit code means the command ran, not that the browser appeared. The agent is instructed to ask you to look at the screen rather than claim success.
 
 ## Limits
 
 - Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`, `dial_inspect`, `dial_launch`; opt-in `run_python` and `run_shell`.
 - `run_shell` runs one Termux command (`am`, `termux-open-url`, `pkg`, `ping`, `curl`). It is enabled by the same `--allow-python` / `--allow-exec` flag, because approved Python can already spawn a shell. Every command is shown before it runs.
+- `open_url` opens an http(s) address via `termux-open-url`, falling back to `am start`. It reports every attempt and always sets `verified: false` — Android can block the launch silently.
 - A few catastrophic patterns (`rm -rf /`, `mkfs`, fork bombs) are refused before the prompt. That is a guardrail against a careless model, **not** a security boundary.
 - On failure the agent is told to read the error and try a different approach, up to about 5 real attempts, instead of stopping at the first error.
 - For LAN IP / nearby devices, the agent should use `local_ipv4` and `ssdp_discover` instead of writing scan scripts. SSDP still misses silent TVs.

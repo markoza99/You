@@ -281,6 +281,18 @@ class Tools:
             "note": "SSDP only lists devices that answer multicast. A silent Android TV often will not appear. Use the TV network page or router DHCP list.",
         }
 
+    def _add_lan_device(self, devices, ip, local_ip, source, mac='unknown', extra=None):
+        entry = devices.get(ip, {'ip': ip, 'mac': 'unknown', 'source': source, 'self': ip == local_ip})
+        if mac and mac not in ('unknown', '00:00:00:00:00:00', '*'):
+            entry['mac'] = mac
+        if extra:
+            entry.update(extra)
+        if entry.get('source') and source not in entry['source']:
+            entry['source'] = entry['source'] + '+' + source
+        else:
+            entry['source'] = source
+        devices[ip] = entry
+
     def lan_scan(self):
         info = self.local_ipv4()
         if not info.get('ok'):
@@ -288,41 +300,59 @@ class Tools:
         local_ip = info['ip']
         prefix = '.'.join(local_ip.split('.')[:3])
         errors = []
+        devices = {}
+        env = self._child_env()
 
-        def probe(i):
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.35)
+        def ping_one(i):
+            ip = '%s.%d' % (prefix, i)
             try:
-                sock.connect_ex(('%s.%s' % (prefix, i), 80))
-            except OSError:
-                pass
-            finally:
-                sock.close()
+                proc = subprocess.run(
+                    ['ping', '-c', '1', '-W', '1', ip],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=2, env=env)
+                return ip if proc.returncode == 0 else None
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+
+        def tcp_one(i):
+            ip = '%s.%d' % (prefix, i)
+            for port in (80, 443, 8008, 5353):
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(0.25)
+                try:
+                    err = sock.connect_ex((ip, port))
+                except OSError:
+                    err = -1
+                finally:
+                    sock.close()
+                # 0 = open, 111 = ECONNREFUSED (host up, port closed)
+                if err in (0, 111):
+                    return ip
+            return None
 
         with ThreadPoolExecutor(max_workers=64) as pool:
-            list(pool.map(probe, range(1, 255)))
+            for ip in pool.map(ping_one, range(1, 255)):
+                if ip:
+                    self._add_lan_device(devices, ip, local_ip, 'ping')
+            for ip in pool.map(tcp_one, range(1, 255)):
+                if ip:
+                    self._add_lan_device(devices, ip, local_ip, 'tcp')
 
-        devices = {}
-        arp_text = ''
         try:
             arp_text = Path('/proc/net/arp').read_text()
         except OSError as exc:
+            arp_text = ''
             errors.append('/proc/net/arp: %s' % exc)
         for line in arp_text.splitlines()[1:]:
             parts = line.split()
             if len(parts) < 4:
                 continue
-            ip, _hw, flags, mac = parts[0], parts[1], parts[2], parts[3]
+            ip, mac = parts[0], parts[3]
             if not ip.startswith(prefix + '.'):
                 continue
-            if mac in ('00:00:00:00:00:00', '*') and flags in ('0x0', '0x1'):
+            if mac in ('00:00:00:00:00:00', '*'):
                 continue
-            devices[ip] = {
-                'ip': ip,
-                'mac': mac if mac != '00:00:00:00:00:00' else 'unknown',
-                'source': 'arp',
-                'self': ip == local_ip,
-            }
+            self._add_lan_device(devices, ip, local_ip, 'arp', mac)
 
         neigh = self._run_process(['ip', 'neigh', 'show'])
         if not neigh.get('ok'):
@@ -330,34 +360,25 @@ class Tools:
         else:
             for line in neigh.get('output', '').splitlines():
                 parts = line.split()
-                if len(parts) < 1 or not parts[0].startswith(prefix + '.'):
+                if not parts or not parts[0].startswith(prefix + '.'):
                     continue
                 ip = parts[0]
-                mac = 'unknown'
-                if 'lladdr' in parts:
-                    mac = parts[parts.index('lladdr') + 1]
-                entry = devices.get(ip, {'ip': ip, 'mac': mac, 'source': 'ip-neigh', 'self': ip == local_ip})
-                if mac != 'unknown':
-                    entry['mac'] = mac
-                    entry['source'] = 'ip-neigh'
-                devices[ip] = entry
+                mac = parts[parts.index('lladdr') + 1] if 'lladdr' in parts else 'unknown'
+                self._add_lan_device(devices, ip, local_ip, 'ip-neigh', mac)
 
         ssdp = self.ssdp_discover()
         for item in ssdp.get('devices') or []:
             ip = item.get('ip')
             if not ip:
                 continue
-            entry = devices.get(ip, {'ip': ip, 'mac': 'unknown', 'source': 'ssdp', 'self': ip == local_ip})
-            entry['ssdp_server'] = item.get('server', '')
-            entry['ssdp_st'] = item.get('st', '')
-            if entry.get('source') == 'ssdp' or entry.get('mac') == 'unknown':
-                entry['source'] = (entry.get('source') + '+ssdp') if entry.get('source') != 'ssdp' else 'ssdp'
-            devices[ip] = entry
+            self._add_lan_device(devices, ip, local_ip, 'ssdp', extra={
+                'ssdp_server': item.get('server', ''),
+                'ssdp_st': item.get('st', ''),
+            })
 
-        if local_ip not in devices:
-            devices[local_ip] = {'ip': local_ip, 'mac': 'unknown', 'source': 'self', 'self': True}
-
+        self._add_lan_device(devices, local_ip, local_ip, 'self')
         rows = sorted(devices.values(), key=lambda d: [int(p) for p in d['ip'].split('.')])
+        incomplete = len(rows) <= 1 or any('Permission denied' in e for e in errors)
         return {
             'ok': True,
             'phone_ip': local_ip,
@@ -365,8 +386,9 @@ class Tools:
             'devices': rows,
             'count': len(rows),
             'errors': errors,
-            'note': 'Android often denies /proc/net/arp and netlink. Silent or sleeping hosts '
-                    'will not appear. The router DHCP page is more complete.',
+            'incomplete': incomplete,
+            'note': 'MAC needs ARP/netlink, which Android often denies. Live IPs still count. '
+                    'If count is 1, call ssdp_discover next. Do not stop. Router DHCP is more complete.',
         }
 
     def _lan_peer(self, ip):

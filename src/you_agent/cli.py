@@ -47,6 +47,9 @@ TERMUX FACTS
 - Open a web page with open_url. Android can block activity starts silently.
 - LAN work: local_ipv4, ssdp_discover, lan_scan, dial_inspect, dial_launch. Stay on this phone's /24.
 - To list Wi-Fi devices with IP and MAC, call lan_scan. Do not write a ping loop.
+- If lan_scan.incomplete is true or count is 1, do NOT stop. Next call ssdp_discover, then
+  local_ipv4. Report every IP you have, even if MAC is unknown. Permission denied on ARP is
+  expected on Android, not a reason to quit.
 - There is no tool named shell. The terminal tool is run_shell. If a tool is unknown, pick one from the list; do not retry the invented name.
 - run_shell uses bash. Android often denies /proc/net/arp and ip neigh; that is not a missing-tool problem.
 - Downloads and installs belong in pkg_install: run_shell has a much shorter timeout.

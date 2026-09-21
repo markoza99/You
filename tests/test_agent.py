@@ -422,17 +422,23 @@ def test_unknown_tool_names_the_mistake(tools):
 
 def test_lan_scan_stays_on_phone_subnet(monkeypatch, tools):
     class FakeSock:
+        def __init__(self, *a, **k):
+            self._peer = None
         def settimeout(self, *_):
             pass
         def connect_ex(self, addr):
-            return 0
+            self._peer = addr
+            return 0 if addr[0] in ('192.168.1.64', '192.168.1.1') else 1
         def close(self):
             pass
         def connect(self, addr):
-            pass
+            self._peer = addr
         def getsockname(self):
             return ('192.168.1.78', 1)
     monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    class FakePing:
+        returncode = 1
+    monkeypatch.setattr('you_agent.tools.subprocess.run', lambda *a, **k: FakePing())
     monkeypatch.setattr(Tools, 'ssdp_discover', lambda self: {
         'ok': True, 'devices': [{'ip': '192.168.1.64', 'server': 'Chromecast/1.6',
                                  'st': 'urn:dial-multiscreen-org:device:dial:1'}]})
@@ -445,6 +451,35 @@ def test_lan_scan_stays_on_phone_subnet(monkeypatch, tools):
     ips = {d['ip'] for d in result['devices']}
     assert '192.168.1.78' in ips
     assert '192.168.1.64' in ips
+    assert '192.168.1.1' in ips
+    tv = next(d for d in result['devices'] if d['ip'] == '192.168.1.64')
+    assert 'ssdp' in tv['source']
+
+
+def test_lan_scan_incomplete_when_only_self(monkeypatch, tools):
+    class FakeSock:
+        def settimeout(self, *_):
+            pass
+        def connect_ex(self, addr):
+            return 1
+        def close(self):
+            pass
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    class FakePing:
+        returncode = 1
+    monkeypatch.setattr('you_agent.tools.subprocess.run', lambda *a, **k: FakePing())
+    monkeypatch.setattr(Tools, 'ssdp_discover', lambda self: {'ok': True, 'devices': []})
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv, timeout=None: {
+        'ok': False, 'exit_code': 1, 'output': 'Permission denied',
+        'error': None, 'truncated': False})
+    result = tools.execute('lan_scan', {})
+    assert result['ok']
+    assert result['count'] == 1
+    assert result['incomplete'] is True
 
 
 def test_check_command_reports_presence(monkeypatch, tools):

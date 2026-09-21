@@ -80,6 +80,6 @@ def with_memory(goal, facts):
         for key, value in facts.items():
             lines.append('- %s: %s' % (key, value))
         if facts.get('tv_youtube_dial') == 'no':
-            lines.append('HARD FACT: DIAL YouTube is not exposed on the remembered TV. Do not launch or install Cast stacks.')
+            lines.append('FACT: GET /apps/YouTube was 404. If the user still asks to open YouTube, call dial_launch once (POST anyway). If POST fails, stop. Do not install Cast stacks.')
     lines.append('User goal: ' + goal)
     return '\n'.join(lines)

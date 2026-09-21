@@ -175,7 +175,8 @@ def test_dial_launch_stops_when_youtube_404(monkeypatch, tools):
     result = tools.execute('dial_launch', {'ip': '192.168.1.64', 'app': 'YouTube'})
     assert not result['ok']
     assert result.get('stop') is True
-    assert '404' in result['error'] or 'not exposed' in result['error']
+    assert result.get('attempts')
+    assert any(a.get('launch_status') == 404 for a in result['attempts'])
 
 
 def test_dial_launch_denied(monkeypatch, tools):
@@ -564,7 +565,7 @@ def test_with_memory_includes_environment_and_hard_fact():
     from you_agent.memory import with_memory
     text = with_memory('open youtube on tv', {'tv_ip': '192.168.1.64', 'tv_youtube_dial': 'no'})
     assert 'no tool named shell' in text.lower() or 'There is no tool named shell' in text
-    assert 'HARD FACT' in text
+    assert 'dial_launch' in text
     assert 'User goal: open youtube on tv' in text
 
 

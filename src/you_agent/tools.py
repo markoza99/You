@@ -549,35 +549,8 @@ class Tools:
             'note': 'A YouTube icon on the TV home screen is not DIAL. 404 means this TV does not expose that DIAL app. Do not claim launch succeeded.',
         }
 
-    def dial_launch(self, ip, app):
-        self._lan_peer(ip)
-        allowed = {'YouTube', 'YouTubeLeanback', 'YouTubeTV', 'Netflix'}
-        if app not in allowed:
-            raise ValueError('app must be one of: ' + ', '.join(sorted(allowed)))
-        inspect = self.dial_inspect(ip)
-        youtube_apps = {'YouTube', 'YouTubeLeanback', 'YouTubeTV'}
-        if app in youtube_apps and not inspect.get('youtube_dial_available'):
-            return {
-                'ok': False,
-                'error': 'DIAL YouTube is not exposed on this TV (HTTP 404). Do not retry, '
-                         'do not install Cast libraries. Use the TV remote or Cast from the '
-                         'phone YouTube app.',
-                'inspect': inspect,
-                'stop': True,
-            }
-        app_base = inspect['application_url']
-        parsed = urlparse(app_base)
-        path = urlparse(urljoin(app_base, app)).path or '/'
-        details = {
-            'ip': ip,
-            'app': app,
-            'url': 'http://%s:%s%s' % (parsed.hostname, parsed.port or 8008, path),
-            'friendly_name': inspect.get('friendly_name', ''),
-            'warning': 'Sends HTTP POST to this LAN TV only. Home-screen YouTube may still ignore DIAL.',
-        }
-        if not self.approve('dial_launch', details):
-            return {'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
-        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 8008, timeout=8)
+    def _dial_post(self, host, port, path):
+        conn = http.client.HTTPConnection(host, port, timeout=8)
         try:
             conn.request('POST', path, body=b'', headers={
                 'Content-Type': 'text/plain; charset="utf-8"',
@@ -586,18 +559,67 @@ class Tools:
             })
             response = conn.getresponse()
             body = response.read(LIMIT)
-            launch_status = response.status
-            launch_body = body.decode('utf-8', errors='replace')[:500]
+            return response.status, body.decode('utf-8', errors='replace')[:500]
         finally:
             conn.close()
-        return {
-            'ok': launch_status in (200, 201, 204),
+
+    def dial_launch(self, ip, app):
+        self._lan_peer(ip)
+        allowed = {'YouTube', 'YouTubeLeanback', 'YouTubeTV', 'Netflix'}
+        if app not in allowed:
+            raise ValueError('app must be one of: ' + ', '.join(sorted(allowed)))
+        inspect = self.dial_inspect(ip)
+        youtube_apps = ['YouTube', 'YouTubeLeanback', 'YouTubeTV']
+        names = youtube_apps if app in youtube_apps else [app]
+        app_base = inspect['application_url']
+        parsed = urlparse(app_base)
+        host, port = parsed.hostname, parsed.port or 8008
+        details = {
             'ip': ip,
             'app': app,
-            'launch_status': launch_status,
-            'launch_body': launch_body,
+            'try_apps': names,
+            'url': 'http://%s:%s%s' % (host, port, urlparse(urljoin(app_base, names[0])).path or '/'),
+            'friendly_name': inspect.get('friendly_name', ''),
+            'get_youtube_available': inspect.get('youtube_dial_available'),
+            'warning': 'Sends HTTP POST to this LAN TV. GET 404 does not skip POST. Look at the TV.',
+        }
+        if not self.approve('dial_launch', details):
+            return {'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
+        attempts = []
+        for name in names:
+            path = urlparse(urljoin(app_base, name)).path or '/'
+            try:
+                status, body = self._dial_post(host, port, path)
+            except OSError as exc:
+                attempts.append({'app': name, 'launch_status': None, 'error': str(exc)[:200]})
+                continue
+            attempts.append({'app': name, 'launch_status': status, 'launch_body': body})
+            if status in (200, 201, 204):
+                return {
+                    'ok': True,
+                    'ip': ip,
+                    'app': name,
+                    'launch_status': status,
+                    'launch_body': body,
+                    'attempts': attempts,
+                    'inspect': inspect,
+                    'verified': False,
+                    'note': 'DIAL POST accepted. Look at the TV. Do not claim YouTube opened.',
+                }
+        last = attempts[-1] if attempts else {}
+        return {
+            'ok': False,
+            'ip': ip,
+            'app': app,
+            'launch_status': last.get('launch_status'),
+            'launch_body': last.get('launch_body', ''),
+            'attempts': attempts,
             'inspect': inspect,
-            'note': 'HTTP 201/200/204 means the DIAL server accepted the launch. The TV home-screen app can still stay closed.',
+            'stop': True,
+            'error': 'DIAL POST failed for %s. GET 404 plus POST failure means this TV will not '
+                     'open YouTube from Termux. Use the TV remote or Cast from the phone YouTube app. '
+                     'Do not install pychromecast.' % ', '.join(names),
+            'note': 'Tried anyway. Quote attempts. Do not retry the same launch.',
         }
 
     # Catastrophic patterns refused before the approval prompt. This is a guardrail

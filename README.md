@@ -81,6 +81,7 @@ Because of that, `open_url` always returns `verified: false`. A zero exit code m
 - Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`, `dial_inspect`, `dial_launch`, `android_check`, `check_command`, `pkg_install`, `open_url`, `think`, `memory_get`, `memory_set`; opt-in `run_python` and `run_shell`.
 - The agent is expected to be self-sufficient: it checks for a missing program with `check_command` and installs it with `pkg_install` rather than telling you to do it. `pkg_install` still shows an approval prompt, and uses a 300 s timeout instead of the 15 s one used by `run_shell`.
 - `lan_scan` lists this phone's Wi-Fi `/24` (IP + MAC via ARP/SSDP). Prefer it over a ping loop: Android often denies `/proc/net/arp` and `ip neigh`.
+- `lan_probe` identifies one LAN IP (ping, reverse DNS, HTTP/HTTPS). Do not install `nslookup`/`dnsmasq`/`bind-tools` for that. `identity=unknown` is valid.
 - `run_shell` runs one Termux command (`am`, `termux-open-url`, `pkg`, `ping`, `curl`). It is enabled by the same `--allow-python` / `--allow-exec` flag, because approved Python can already spawn a shell. Every command is shown before it runs.
 - `open_url` opens an http(s) address via `termux-open-url`, falling back to `am start`. It reports every attempt and always sets `verified: false` — Android can block the launch silently.
 - A few catastrophic patterns (`rm -rf /`, `mkfs`, fork bombs) are refused before the prompt. That is a guardrail against a careless model, **not** a security boundary.

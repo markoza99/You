@@ -482,6 +482,55 @@ def test_lan_scan_incomplete_when_only_self(monkeypatch, tools):
     assert result['incomplete'] is True
 
 
+def test_lan_probe_rejects_other_subnet(monkeypatch, tools):
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    result = tools.execute('lan_probe', {'ip': '10.0.0.5'})
+    assert not result['ok']
+
+
+def test_lan_probe_unknown_is_ok(monkeypatch, tools):
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv, timeout=None: {
+        'ok': True, 'exit_code': 0, 'output': '1 packets transmitted, 1 received',
+        'error': None, 'truncated': False})
+    monkeypatch.setattr('you_agent.tools.socket.gethostbyaddr',
+                        lambda ip: (_ for _ in ()).throw(socket.herror('no name')))
+    monkeypatch.setattr(Tools, '_http_probe', lambda self, ip, port, use_ssl=False: {
+        'ok': False, 'port': port, 'tls': use_ssl, 'error': 'refused'})
+    result = tools.execute('lan_probe', {'ip': '192.168.1.68'})
+    assert result['ok']
+    assert result['alive'] is True
+    assert result['identity'] == 'unknown'
+
+
+def test_pkg_install_refuses_dnsmasq(tools):
+    result = tools.execute('pkg_install', {'package': 'dnsmasq'})
+    assert not result['ok']
+    assert 'lan_probe' in result['error']
+
+
+def test_check_command_maps_nslookup_to_dnsutils(monkeypatch, tools):
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: None)
+    result = tools.execute('check_command', {'name': 'nslookup'})
+    assert result['ok'] and result['installed'] is False
+    assert result['pkg'] == 'dnsutils'
+    assert 'dnsutils' in result['note']
+
+
 def test_check_command_reports_presence(monkeypatch, tools):
     monkeypatch.setattr('you_agent.tools.shutil.which',
                         lambda name: '/bin/ping' if name == 'ping' else None)

@@ -10,6 +10,7 @@ import selectors
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -43,6 +44,8 @@ DECLARATIONS = [
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
     declaration("lan_scan", "List devices on THIS phone Wi-Fi /24 with IP and MAC. Parallel ping plus ARP/SSDP. Prefer this over writing a ping loop. Stay on this LAN.", {}, []),
+    declaration("lan_probe", "Identify one LAN IPv4: ping, reverse DNS, HTTP/HTTPS headers. Stay on this phone /24. Prefer this over nslookup/curl/pkg_install.",
+                {"ip": TEXT}, ["ip"]),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
                 {"ip": TEXT}, ["ip"]),
     declaration("dial_launch", "POST a DIAL launch to one LAN IPv4 app (YouTube, YouTubeLeanback, Netflix). Requires approval. Not a home-screen tap.",
@@ -135,6 +138,8 @@ class Tools:
                 return self.ssdp_discover()
             if name == 'lan_scan':
                 return self.lan_scan()
+            if name == 'lan_probe':
+                return self.lan_probe(args['ip'])
             if name == 'dial_inspect':
                 return self.dial_inspect(args['ip'])
             if name == 'dial_launch':
@@ -391,6 +396,94 @@ class Tools:
                     'If count is 1, call ssdp_discover next. Do not stop. Router DHCP is more complete.',
         }
 
+    def _same_lan(self, ip):
+        info = self.local_ipv4()
+        if not info.get('ok'):
+            raise ValueError(info.get('error') or 'Could not detect this phone LAN IP.')
+        local = info['ip']
+        if not re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', ip):
+            raise ValueError('ip must be IPv4 dotted decimal.')
+        if any(int(p) > 255 for p in ip.split('.')):
+            raise ValueError('Invalid IPv4 address.')
+        if ip.split('.')[:3] != local.split('.')[:3]:
+            raise ValueError('Target is not on this phone /24.')
+        if ip in ('127.0.0.1', '0.0.0.0'):
+            raise ValueError('Loopback is not a LAN host.')
+        return local, info['subnet']
+
+    def _http_probe(self, ip, port, use_ssl=False):
+        conn = None
+        try:
+            if use_ssl:
+                context = ssl._create_unverified_context()
+                conn = http.client.HTTPSConnection(ip, port, timeout=4, context=context)
+            else:
+                conn = http.client.HTTPConnection(ip, port, timeout=4)
+            conn.request('GET', '/', headers={'User-Agent': 'You-Termux-Agent/0.2', 'Accept': '*/*'})
+            response = conn.getresponse()
+            raw = response.read(2048)
+            body = raw.decode('utf-8', errors='replace')
+            title = ''
+            match = re.search(r'<title[^>]*>([^<]{1,120})</title>', body, re.I)
+            if match:
+                title = match.group(1).strip()
+            headers = {k.lower(): v for k, v in response.getheaders()}
+            return {'ok': True, 'port': port, 'tls': use_ssl, 'status': response.status,
+                    'server': headers.get('server', ''), 'title': title}
+        except (OSError, ssl.SSLError, http.client.HTTPException, ValueError) as exc:
+            return {'ok': False, 'port': port, 'tls': use_ssl, 'error': str(exc)[:200]}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def lan_probe(self, ip):
+        local, subnet = self._same_lan(ip)
+        ping = self._run_process(['ping', '-c', '1', '-W', '1', ip], timeout=4)
+        alive = bool(ping.get('ok'))
+        hostname = None
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+        except (OSError, socket.herror, socket.gaierror):
+            hostname = None
+        http80 = self._http_probe(ip, 80, False)
+        https443 = self._http_probe(ip, 443, True)
+        http8008 = self._http_probe(ip, 8008, False)
+        guess = 'unknown'
+        evidence = []
+        if hostname:
+            evidence.append('ptr=' + hostname)
+        for probe in (http80, https443, http8008):
+            if probe.get('ok'):
+                bit = ':%s status=%s' % (probe['port'], probe.get('status'))
+                if probe.get('server'):
+                    bit += ' server=' + probe['server']
+                if probe.get('title'):
+                    bit += ' title=' + probe['title']
+                evidence.append(bit)
+        if ip == local:
+            guess = 'this phone'
+        elif hostname:
+            guess = hostname
+        elif any(p.get('ok') and 'dial' in (p.get('server') or '').lower() for p in (http80, http8008)):
+            guess = 'cast/dial device'
+        return {
+            'ok': True,
+            'ip': ip,
+            'phone_ip': local,
+            'subnet': subnet,
+            'alive': alive,
+            'ping_output': (ping.get('output') or '')[:400],
+            'hostname': hostname,
+            'http': [http80, https443, http8008],
+            'identity': guess,
+            'evidence': evidence,
+            'note': 'identity=unknown is valid. Do not install nslookup/dnsmasq/bind-tools. '
+                    'Write any requested report with this JSON even if the host stays unnamed.',
+        }
+
     def _lan_peer(self, ip):
         info = self.local_ipv4()
         if not info.get('ok'):
@@ -624,46 +717,78 @@ class Tools:
                     'the user an app is missing based only on an empty package list.',
         }
 
+    COMMAND_PACKAGES = {
+        'nslookup': 'dnsutils',
+        'dig': 'dnsutils',
+        'host': 'dnsutils',
+        'nmap': 'nmap',
+        'curl': 'curl',
+        'wget': 'wget',
+        'python3': None,
+        'ping': None,
+        'ip': None,
+    }
+    PKG_ALIASES = {
+        'bind-tools': 'dnsutils',
+        'bind9-utils': 'dnsutils',
+        'bind9-dnsutils': 'dnsutils',
+        'dnsutils': 'dnsutils',
+    }
+
     def check_command(self, name):
         name = name.strip()
         if not re.fullmatch(r'[A-Za-z0-9._+-]{1,60}', name):
             raise ValueError('Invalid command name.')
         path = shutil.which(name)
+        pkg = self.COMMAND_PACKAGES.get(name)
+        note = 'If installed is false, install it yourself with pkg_install.'
+        if pkg:
+            note = 'Termux package for this command is %s, not bind-tools or dnsmasq. ' % pkg + note
+        elif name in self.COMMAND_PACKAGES:
+            note = 'This command is part of Termux base; do not pkg_install it.'
+        elif name in ('nslookup', 'dig', 'getent'):
+            note = 'Do not install a DNS server for reverse lookup. Use lan_probe instead.'
         return {
             'ok': True,
             'name': name,
             'installed': bool(path),
             'path': path,
-            'note': 'If installed is false, install it yourself with pkg_install instead of '
-                    'asking the user. The Termux package name is not always the command name.',
+            'pkg': pkg,
+            'note': note,
         }
 
     def pkg_install(self, package):
         package = package.strip()
         if not re.fullmatch(r'[a-z0-9][a-z0-9._+-]{0,60}', package):
             raise ValueError('Invalid Termux package name.')
+        mapped = self.PKG_ALIASES.get(package, package)
+        if package == 'dnsmasq':
+            return {'ok': False, 'package': package,
+                    'error': 'dnsmasq is a DHCP/DNS server, not nslookup. For reverse DNS use '
+                             'lan_probe. To install nslookup: pkg_install dnsutils.'}
         if not shutil.which('pkg'):
             return {'ok': False, 'package': package,
                     'error': 'pkg is not available; this does not look like Termux.'}
         details = {
-            'package': package,
-            'command': 'pkg install -y ' + package,
+            'package': mapped,
+            'requested': package,
+            'command': 'pkg install -y ' + mapped,
             'timeout_seconds': self.install_timeout,
             'warning': 'Installs software on this phone as your Termux user.',
         }
         if not self.approve('pkg_install', details):
-            return {'ok': False, 'package': package, 'error': 'User denied package install.'}
-        result = self._run_process(['pkg', 'install', '-y', package],
+            return {'ok': False, 'package': mapped, 'error': 'User denied package install.'}
+        result = self._run_process(['pkg', 'install', '-y', mapped],
                                    timeout=self.install_timeout)
         output = result.get('output', '')
         return {
             'ok': result['ok'],
-            'package': package,
+            'package': mapped,
+            'requested': package,
             'exit_code': result['exit_code'],
-            'output': output[-2000:],
+            'output': output[-800:],
             'error': result.get('error'),
-            'note': 'Verify with check_command afterwards: a package can install while the '
-                    'command you wanted has a different name.',
+            'note': 'Verify with check_command afterwards. Termux nslookup is in dnsutils, not bind-tools.',
         }
 
     def run_shell(self, command):

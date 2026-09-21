@@ -45,14 +45,18 @@ TERMUX FACTS
 - run_shell runs one command. run_python cannot execute a .sh file.
 - Big file? Use grep, head, tail or wc through run_shell instead of read_file.
 - Open a web page with open_url. Android can block activity starts silently.
-- LAN work: local_ipv4, ssdp_discover, lan_scan, dial_inspect, dial_launch. Stay on this phone's /24.
+- LAN work: local_ipv4, ssdp_discover, lan_scan, lan_probe, dial_inspect, dial_launch. Stay on this phone's /24.
 - To list Wi-Fi devices with IP and MAC, call lan_scan. Do not write a ping loop.
+- To identify ONE LAN IP (ping, reverse DNS, HTTP/HTTPS), call lan_probe. Do not install
+  nslookup, dnsmasq, bind-tools, or getent. identity=unknown is a valid answer.
 - If lan_scan.incomplete is true or count is 1, do NOT stop. Next call ssdp_discover, then
   local_ipv4. Report every IP you have, even if MAC is unknown. Permission denied on ARP is
   expected on Android, not a reason to quit.
 - There is no tool named shell. The terminal tool is run_shell. If a tool is unknown, pick one from the list; do not retry the invented name.
 - run_shell uses bash. Android often denies /proc/net/arp and ip neigh; that is not a missing-tool problem.
 - Downloads and installs belong in pkg_install: run_shell has a much shorter timeout.
+- Termux nslookup is package dnsutils, not bind-tools. Never install dnsmasq for DNS lookup.
+- If a report file is requested, write it before you hit token/step limits. Unknown is allowed.
 
 MEMORY
 - memory_get when the goal leans on earlier facts. memory_set for durable ones like tv_ip.
@@ -180,7 +184,7 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds
             extra = ''
             if name in ('run_python', 'run_shell') and result.get('output'):
                 extra = '\n' + result['output'][:2000]
-            elif name in ('local_ipv4', 'ssdp_discover', 'lan_scan', 'dial_inspect', 'dial_launch', 'think', 'memory_get', 'memory_set', 'open_url', 'android_check', 'check_command', 'pkg_install'):
+            elif name in ('local_ipv4', 'ssdp_discover', 'lan_scan', 'lan_probe', 'dial_inspect', 'dial_launch', 'think', 'memory_get', 'memory_set', 'open_url', 'android_check', 'check_command', 'pkg_install'):
                 extra = '\n' + json.dumps(result, ensure_ascii=True)[:2000]
             elif not result.get('ok') and result.get('error'):
                 extra = ' (' + str(result['error'])[:200] + ')'
@@ -212,7 +216,7 @@ def main(argv=None):
                      help='Expose unsandboxed run_python and run_shell; each execution still asks approval unless --yes')
     run.add_argument('--yes', action='store_true', help='Approve writes, Python, and shell for THIS run only. Not a permanent auto-approve mode.')
     run.add_argument('--max-steps', type=int, default=16)
-    run.add_argument('--max-tokens', type=int, default=40000)
+    run.add_argument('--max-tokens', type=int, default=60000)
     run.add_argument('--max-seconds', type=int, default=240)
     args = parser.parse_args(argv)
     key = api_key()

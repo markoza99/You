@@ -35,6 +35,16 @@ def remember_from_result(facts, name, result):
     if name == 'local_ipv4' and result.get('ip'):
         updated['phone_ip'] = result['ip']
         updated['phone_subnet'] = result.get('subnet', '')
+    if name == 'lan_scan':
+        if result.get('phone_ip'):
+            updated['phone_ip'] = result['phone_ip']
+        if result.get('subnet'):
+            updated['phone_subnet'] = result['subnet']
+        for device in result.get('devices') or []:
+            server = (device.get('ssdp_server') or '').lower()
+            if 'chromecast' in server or 'dial' in (device.get('ssdp_st') or '').lower():
+                updated['tv_ip'] = device.get('ip', '')
+                break
     if name == 'ssdp_discover':
         if result.get('phone_ip'):
             updated['phone_ip'] = result['phone_ip']

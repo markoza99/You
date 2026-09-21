@@ -1,4 +1,5 @@
 """Workspace tools. Path controls are not isolation for approved Python code."""
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
 import json
@@ -41,6 +42,7 @@ DECLARATIONS = [
                 {"package": TEXT}, ["package"]),
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
+    declaration("lan_scan", "List devices on THIS phone Wi-Fi /24 with IP and MAC. Parallel ping plus ARP/SSDP. Prefer this over writing a ping loop. Stay on this LAN.", {}, []),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
                 {"ip": TEXT}, ["ip"]),
     declaration("dial_launch", "POST a DIAL launch to one LAN IPv4 app (YouTube, YouTubeLeanback, Netflix). Requires approval. Not a home-screen tap.",
@@ -111,22 +113,28 @@ class Tools:
         try:
             expected = {d['name']: d for d in self.declarations}
             if name not in expected:
-                raise ValueError("Unknown or disabled tool.")
+                raise ValueError("Unknown tool %r. Available: %s" % (
+                    name, ', '.join(sorted(expected))))
             fields = expected[name]['parameters']['required']
             if not isinstance(args, dict):
                 raise ValueError("Tool arguments must be a JSON object.")
             if not fields:
                 # Tools that take no arguments: drop stray keys instead of failing the step.
                 args = {}
-            elif set(args) != set(fields):
-                raise ValueError("Tool arguments do not match the schema. Expected exactly: "
+            elif not set(fields).issubset(set(args)):
+                raise ValueError("Tool arguments do not match the schema. Expected: "
                                  + ', '.join(sorted(fields)))
+            else:
+                # Models often send extra keys (timeout, cwd). Keep only the schema fields.
+                args = {k: args[k] for k in fields}
             if any(not isinstance(v, str) for v in args.values()):
                 raise ValueError("Tool arguments must be strings.")
             if name == 'local_ipv4':
                 return self.local_ipv4()
             if name == 'ssdp_discover':
                 return self.ssdp_discover()
+            if name == 'lan_scan':
+                return self.lan_scan()
             if name == 'dial_inspect':
                 return self.dial_inspect(args['ip'])
             if name == 'dial_launch':
@@ -271,6 +279,94 @@ class Tools:
             "devices": list(found.values()),
             "count": len(found),
             "note": "SSDP only lists devices that answer multicast. A silent Android TV often will not appear. Use the TV network page or router DHCP list.",
+        }
+
+    def lan_scan(self):
+        info = self.local_ipv4()
+        if not info.get('ok'):
+            return info
+        local_ip = info['ip']
+        prefix = '.'.join(local_ip.split('.')[:3])
+        errors = []
+
+        def probe(i):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.35)
+            try:
+                sock.connect_ex(('%s.%s' % (prefix, i), 80))
+            except OSError:
+                pass
+            finally:
+                sock.close()
+
+        with ThreadPoolExecutor(max_workers=64) as pool:
+            list(pool.map(probe, range(1, 255)))
+
+        devices = {}
+        arp_text = ''
+        try:
+            arp_text = Path('/proc/net/arp').read_text()
+        except OSError as exc:
+            errors.append('/proc/net/arp: %s' % exc)
+        for line in arp_text.splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            ip, _hw, flags, mac = parts[0], parts[1], parts[2], parts[3]
+            if not ip.startswith(prefix + '.'):
+                continue
+            if mac in ('00:00:00:00:00:00', '*') and flags in ('0x0', '0x1'):
+                continue
+            devices[ip] = {
+                'ip': ip,
+                'mac': mac if mac != '00:00:00:00:00:00' else 'unknown',
+                'source': 'arp',
+                'self': ip == local_ip,
+            }
+
+        neigh = self._run_process(['ip', 'neigh', 'show'])
+        if not neigh.get('ok'):
+            errors.append('ip neigh: %s' % (neigh.get('output') or neigh.get('error') or 'failed'))
+        else:
+            for line in neigh.get('output', '').splitlines():
+                parts = line.split()
+                if len(parts) < 1 or not parts[0].startswith(prefix + '.'):
+                    continue
+                ip = parts[0]
+                mac = 'unknown'
+                if 'lladdr' in parts:
+                    mac = parts[parts.index('lladdr') + 1]
+                entry = devices.get(ip, {'ip': ip, 'mac': mac, 'source': 'ip-neigh', 'self': ip == local_ip})
+                if mac != 'unknown':
+                    entry['mac'] = mac
+                    entry['source'] = 'ip-neigh'
+                devices[ip] = entry
+
+        ssdp = self.ssdp_discover()
+        for item in ssdp.get('devices') or []:
+            ip = item.get('ip')
+            if not ip:
+                continue
+            entry = devices.get(ip, {'ip': ip, 'mac': 'unknown', 'source': 'ssdp', 'self': ip == local_ip})
+            entry['ssdp_server'] = item.get('server', '')
+            entry['ssdp_st'] = item.get('st', '')
+            if entry.get('source') == 'ssdp' or entry.get('mac') == 'unknown':
+                entry['source'] = (entry.get('source') + '+ssdp') if entry.get('source') != 'ssdp' else 'ssdp'
+            devices[ip] = entry
+
+        if local_ip not in devices:
+            devices[local_ip] = {'ip': local_ip, 'mac': 'unknown', 'source': 'self', 'self': True}
+
+        rows = sorted(devices.values(), key=lambda d: [int(p) for p in d['ip'].split('.')])
+        return {
+            'ok': True,
+            'phone_ip': local_ip,
+            'subnet': info['subnet'],
+            'devices': rows,
+            'count': len(rows),
+            'errors': errors,
+            'note': 'Android often denies /proc/net/arp and netlink. Silent or sleeping hosts '
+                    'will not appear. The router DHCP page is more complete.',
         }
 
     def _lan_peer(self, ip):
@@ -570,7 +666,8 @@ class Tools:
         }
         if not self.approve('run_shell', details):
             return {'ok': False, 'error': 'User denied shell execution.', 'command': command}
-        result = self._run_process(['/bin/sh', '-c', command])
+        shell = shutil.which('bash') or '/bin/sh'
+        result = self._run_process([shell, '-c', command])
         result['command'] = command
         if result['ok'] and not result['output'].strip():
             result['note'] = ('Exit code 0 with no output. The command ran, but this is NOT '

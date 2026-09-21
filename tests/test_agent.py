@@ -406,6 +406,47 @@ def test_child_env_used_by_subprocess(tools):
         os.environ.pop('YOU_TEST_MARKER', None)
 
 
+def test_run_shell_ignores_extra_keys(tools):
+    tools.allow_python = True
+    result = tools.execute('run_shell', {'command': 'echo extra-ok', 'timeout': '15', 'cwd': '/tmp'})
+    assert result['ok'] and 'extra-ok' in result['output']
+
+
+def test_unknown_tool_names_the_mistake(tools):
+    tools.allow_python = True
+    result = tools.execute('shell', {'command': 'echo hi'})
+    assert not result['ok']
+    assert 'shell' in result['error']
+    assert 'run_shell' in result['error']
+
+
+def test_lan_scan_stays_on_phone_subnet(monkeypatch, tools):
+    class FakeSock:
+        def settimeout(self, *_):
+            pass
+        def connect_ex(self, addr):
+            return 0
+        def close(self):
+            pass
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    monkeypatch.setattr(Tools, 'ssdp_discover', lambda self: {
+        'ok': True, 'devices': [{'ip': '192.168.1.64', 'server': 'Chromecast/1.6',
+                                 'st': 'urn:dial-multiscreen-org:device:dial:1'}]})
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv, timeout=None: {
+        'ok': False, 'exit_code': 1, 'output': 'Cannot bind netlink socket: Permission denied',
+        'error': None, 'truncated': False})
+    result = tools.execute('lan_scan', {})
+    assert result['ok']
+    assert result['phone_ip'] == '192.168.1.78'
+    ips = {d['ip'] for d in result['devices']}
+    assert '192.168.1.78' in ips
+    assert '192.168.1.64' in ips
+
+
 def test_check_command_reports_presence(monkeypatch, tools):
     monkeypatch.setattr('you_agent.tools.shutil.which',
                         lambda name: '/bin/ping' if name == 'ping' else None)

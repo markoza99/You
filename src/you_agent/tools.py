@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import selectors
@@ -26,6 +27,8 @@ def declaration(name, description, properties, required):
 
 TEXT = {"type": "STRING"}
 DECLARATIONS = [
+    declaration("environment_info", "Read actual platform, workspace, enabled tools and command availability. No network, shell execution, or secrets.", {}, []),
+    declaration("tv_capabilities", "Read-only TCP reachability checks on one LAN TV for DIAL, Cast, Android TV remote and legacy ADB. Ports are hints, not verified protocols. Does not pair or launch.", {"ip": TEXT}, ["ip"]),
     declaration("list_files", "List up to 100 entries in a workspace directory.", {"path": TEXT}, ["path"]),
     declaration("read_file", "Read a UTF-8 workspace file, up to 16000 bytes.", {"path": TEXT}, ["path"]),
     declaration("write_file", "Create or overwrite a UTF-8 file, only after user approval.",
@@ -46,6 +49,8 @@ DECLARATIONS = [
     declaration("lan_scan", "List devices on THIS phone Wi-Fi /24 with IP and MAC. Parallel ping plus ARP/SSDP. Prefer this over writing a ping loop. Stay on this LAN.", {}, []),
     declaration("lan_probe", "Identify one LAN IPv4: ping, reverse DNS, HTTP/HTTPS headers. Stay on this phone /24. Prefer this over nslookup/curl/pkg_install.",
                 {"ip": TEXT}, ["ip"]),
+    declaration("host_probe", "Bounded read-only probe of ONE LAN /24 host: ICMP echo, PTR, TCP reachability on a small fixed port list, and HTTP service banners. No authentication, no OS fingerprint, no launch, no pairing. mDNS/SSDP/NetBIOS are NOT covered by this tool.",
+                {"ip": TEXT, "ports": TEXT}, ["ip"]),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
                 {"ip": TEXT}, ["ip"]),
     declaration("dial_launch", "POST a DIAL launch to one LAN IPv4 app (YouTube, YouTubeLeanback, Netflix). Requires approval. Not a home-screen tap.",
@@ -116,8 +121,9 @@ class Tools:
         try:
             expected = {d['name']: d for d in self.declarations}
             if name not in expected:
-                raise ValueError("Unknown tool %r. Available: %s" % (
-                    name, ', '.join(sorted(expected))))
+                # Structured, recoverable result: tell the model exactly what is enabled and
+                # how to enable a disabled tool (real CLI flag), instead of a bare terminal error.
+                return self._unknown_tool_result(name, expected)
             fields = expected[name]['parameters']['required']
             if not isinstance(args, dict):
                 raise ValueError("Tool arguments must be a JSON object.")
@@ -132,6 +138,10 @@ class Tools:
                 args = {k: args[k] for k in fields}
             if any(not isinstance(v, str) for v in args.values()):
                 raise ValueError("Tool arguments must be strings.")
+            if name == 'environment_info':
+                return self.environment_info()
+            if name == 'tv_capabilities':
+                return self.tv_capabilities(args['ip'])
             if name == 'local_ipv4':
                 return self.local_ipv4()
             if name == 'ssdp_discover':
@@ -140,6 +150,8 @@ class Tools:
                 return self.lan_scan()
             if name == 'lan_probe':
                 return self.lan_probe(args['ip'])
+            if name == 'host_probe':
+                return self.host_probe(args['ip'], args.get('ports'))
             if name == 'dial_inspect':
                 return self.dial_inspect(args['ip'])
             if name == 'dial_launch':
@@ -197,7 +209,7 @@ class Tools:
                 if self.secret and self.secret in args['content']:
                     raise ValueError("Refusing to write the API key.")
                 if not self.approve('write_file', dict(args)):
-                    return {"ok": False, "error": "User denied file write."}
+                    return {'denied': True, 'stop': True, 'error_kind': 'user_denied', "ok": False, "error": "User denied file write."}
                 path = self.path(args['path'])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
@@ -211,12 +223,158 @@ class Tools:
                        "cwd": str(self.root), "timeout_seconds": self.timeout,
                        "warning": "NOT SANDBOXED: can access Termux files/network and change or delete data."}
             if not self.approve('run_python', details):
-                return {"ok": False, "error": "User denied Python execution."}
+                return {'denied': True, 'stop': True, 'error_kind': 'user_denied', "ok": False, "error": "User denied Python execution."}
             if self.path(args['path']).read_bytes() != code:
                 raise ValueError("Script changed after approval; refusing execution.")
             return self.run_python(path)
         except (OSError, ValueError, UnicodeError) as exc:
             return {"ok": False, "error": self.redact(str(exc))[:1000]}
+
+    def environment_info(self):
+        return {
+            'ok': True,
+            'platform': platform.system(),
+            'machine': platform.machine(),
+            'python_version': platform.python_version(),
+            'termux_detected': 'com.termux' in os.environ.get('PREFIX', ''),
+            'workspace': str(self.root),
+            'code_execution_enabled': self.allow_python,
+            'enabled_tools': [d['name'] for d in self.declarations],
+            'commands': {name: shutil.which(name) for name in
+                         ('bash', 'pkg', 'adb', 'curl', 'python', 'termux-open-url')},
+            'note': 'Command presence does not prove functionality or permission. No network discovery has run.',
+        }
+
+    # Tools that exist in code but are not enabled for this run, and the exact CLI flag that
+    # exposes them. This map is what lets an unknown/disabled tool name recover instead of
+    # terminating the whole goal.
+    _DISABLED_TOOLS = {
+        'run_python': '--allow-python',
+        'run_shell': '--allow-python',
+    }
+
+    def _unknown_tool_result(self, name, enabled):
+        error = "Unknown tool %r. Available tools: %s" % (
+            name, ', '.join(sorted(enabled)))
+        result = {
+            'ok': False,
+            'error': error,
+            'error_kind': 'unknown_tool',
+            'recoverable': True,
+            'available_tools': sorted(enabled),
+            'enabled_tools': sorted(enabled),
+            'do_not_retry': True,
+            'note': ('Pick one of the enabled tools above. Do not call an invented or disabled '
+                     'tool again; if it is disabled, use the enable flag in the next run.'),
+        }
+        # If the name refers to an execution tool that is disabled in this run, say exactly how
+        # to enable it (the real CLI flag). 'run_sheel' -> 'run_shell', 'shell' -> 'run_shell'.
+        if not self.allow_python:
+            normalized = name.strip().lower()
+            if normalized == 'shell' or normalized.startswith('run_'):
+                disabled = 'run_shell'
+                result['enabled_flag'] = self._DISABLED_TOOLS[disabled]
+                result['enable_hint'] = (
+                    'Tool %r looks like the disabled execution tool %r. Re-run with %s to '
+                    'expose it:  you run %s "goal"' % (name, disabled,
+                                                       self._DISABLED_TOOLS[disabled], self._DISABLED_TOOLS[disabled]))
+                result['note'] += (' %r is disabled; %s enables it.' % (disabled, self._DISABLED_TOOLS[disabled]))
+        return result
+
+    # Bounded, single-host, read-only service discovery. Only a small fixed set of well-known
+    # TCP ports; the caller may add a few (up to a hard cap). ICMP echo, PTR, TCP reachability
+    # and HTTP/HTTPS banners only. Explicitly NOT: OS fingerprinting, authentication, launching,
+    # pairing, or mDNS/SSDP/NetBIOS.
+    _PROBE_PORTS = {
+        80: 'http', 443: 'https', 22: 'ssh', 23: 'telnet', 8080: 'http-alt',
+        8008: 'dial', 8009: 'cast', 6466: 'android-tv-remote', 5555: 'adb',
+    }
+    _PROBE_MAX_PORT_ARG = 8
+
+    def host_probe(self, ip, ports=None):
+        local, subnet = self._same_lan(ip)
+        if ip == local:
+            raise ValueError('Cannot probe this phone with host_probe; target a different LAN host.')
+        if int(ip.split('.')[-1]) in (0, 255):
+            raise ValueError('Target must be a unicast LAN host.')
+        selected = list(self._PROBE_PORTS.items())
+        if ports:
+            extra = []
+            for raw in str(ports).replace(',', ' ').split():
+                if not raw.isdigit():
+                    continue
+                p = int(raw)
+                if 1 <= p <= 65535 and (p, None) not in selected and p not in [s for s, _ in selected]:
+                    extra.append((p, 'requested'))
+                if len(extra) >= self._PROBE_MAX_PORT_ARG:
+                    break
+            selected += extra
+        ping = self._run_process(['ping', '-c', '1', '-W', '1', ip], timeout=4)
+        alive = bool(ping.get('ok'))
+        try:
+            hostname = socket.gethostbyaddr(ip)[0]
+        except (OSError, socket.herror, socket.gaierror):
+            hostname = None
+
+        def probe(port, hint):
+            reachable, service = False, None
+            try:
+                with socket.create_connection((ip, port), timeout=1.5) as conn:
+                    reachable = True
+                    if port in (80, 443, 8080, 8008):
+                        http = self._http_probe(ip, port, use_ssl=(port == 443))
+                        if http.get('ok'):
+                            service = {'banner': (http.get('server') or '')[:120],
+                                       'status': http.get('status'),
+                                       'title': (http.get('title') or '')[:120]}
+            except OSError:
+                reachable = False
+            return {'port': port, 'hint': hint, 'reachable': reachable, 'service': service}
+
+        with ThreadPoolExecutor(max_workers=min(16, max(1, len(selected)))) as pool:
+            ports_result = list(pool.map(probe, [s for s, _ in selected],
+                                         [h for _, h in selected]))
+        return {
+            'ok': True,
+            'ip': ip,
+            'phone_ip': local,
+            'subnet': subnet,
+            'alive': alive,
+            'hostname': hostname,
+            'ports': ports_result,
+            'unimplemented': ['mDNS', 'SSDP', 'NetBIOS'],
+            'os_fingerprint': False,
+            'protocols_verified': False,
+            'note': ('Read-only single-host probe on one LAN /24 IP. Reachable ports and banners '
+                     'are hints, not verified protocols, authorization, or a launch. mDNS/SSDP/'
+                     'NetBIOS are NOT implemented here. No authentication, OS fingerprint, '
+                     'pairing, or launch was attempted.'),
+        }
+
+    def tv_capabilities(self, ip):
+        self._lan_peer(ip)
+        if int(ip.split('.')[-1]) in (0, 255):
+            raise ValueError('Target must be a unicast LAN host.')
+        candidates = ((8008, 'DIAL/HTTP'), (8009, 'Google Cast'),
+                      (6466, 'Android TV remote'), (6467, 'Android TV pairing'),
+                      (5555, 'Legacy ADB'))
+        def probe(candidate):
+            port, hint = candidate
+            try:
+                with socket.create_connection((ip, port), timeout=1.5):
+                    return {'port': port, 'protocol_hint': hint, 'reachable': True}
+            except OSError as exc:
+                return {'port': port, 'protocol_hint': hint, 'reachable': False,
+                        'error': str(exc)[:200]}
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            ports = list(pool.map(probe, candidates))
+        return {
+            'ok': True, 'ip': ip, 'ports': ports, 'protocols_verified': False,
+            'adb_client_available': bool(shutil.which('adb')),
+            'note': 'Open ports do not prove protocol support, pairing, authorization, or app availability. '
+                    'Closed ports do not rule out services on other ports (including wireless ADB). '
+                    'No launch, pairing, authentication or debugging changes were attempted.',
+        }
 
     def local_ipv4(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -584,7 +742,7 @@ class Tools:
             'warning': 'Sends HTTP POST to this LAN TV. GET 404 does not skip POST. Look at the TV.',
         }
         if not self.approve('dial_launch', details):
-            return {'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
         attempts = []
         for name in names:
             path = urlparse(urljoin(app_base, name)).path or '/'
@@ -615,11 +773,13 @@ class Tools:
             'launch_body': last.get('launch_body', ''),
             'attempts': attempts,
             'inspect': inspect,
-            'stop': True,
-            'error': 'DIAL POST failed for %s. GET 404 plus POST failure means this TV will not '
-                     'open YouTube from Termux. Use the TV remote or Cast from the phone YouTube app. '
-                     'Do not install pychromecast.' % ', '.join(names),
-            'note': 'Tried anyway. Quote attempts. Do not retry the same launch.',
+            'stop': False,
+            'error_kind': 'dial_launch_failed',
+            'recoverable': True,
+            'failed_method': 'DIAL',
+            'error': 'DIAL POST failed for %s. Other control methods have not been tested.' % ', '.join(names),
+            'next_tool': {'name': 'tv_capabilities', 'arguments': {'ip': ip}},
+            'note': 'Quote attempts. Do not repeat this launch. Discover other capabilities before selecting another method.',
         }
 
     # Catastrophic patterns refused before the approval prompt. This is a guardrail
@@ -656,7 +816,7 @@ class Tools:
             'warning': 'NOT SANDBOXED: launches an Android intent as your Termux user.',
         }
         if not self.approve('open_url', details):
-            return {'ok': False, 'url': url, 'error': 'User denied opening the URL.'}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'url': url, 'error': 'User denied opening the URL.'}
         attempts = []
         evidence = False
         if available['termux-open-url']:
@@ -822,7 +982,7 @@ class Tools:
             'warning': 'Installs software on this phone as your Termux user.',
         }
         if not self.approve('pkg_install', details):
-            return {'ok': False, 'package': mapped, 'error': 'User denied package install.'}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'package': mapped, 'error': 'User denied package install.'}
         result = self._run_process(['pkg', 'install', '-y', mapped],
                                    timeout=self.install_timeout)
         output = result.get('output', '')
@@ -857,7 +1017,7 @@ class Tools:
             'warning': 'NOT SANDBOXED: runs with your Termux user access and can change or delete data.',
         }
         if not self.approve('run_shell', details):
-            return {'ok': False, 'error': 'User denied shell execution.', 'command': command}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'error': 'User denied shell execution.', 'command': command}
         shell = shutil.which('bash') or '/bin/sh'
         result = self._run_process([shell, '-c', command])
         result['command'] = command

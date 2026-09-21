@@ -55,8 +55,6 @@ def remember_from_result(facts, name, result):
                 updated['tv_ip'] = device.get('ip', '')
                 updated['tv_server'] = device.get('server', '')[:200]
                 break
-        if devices and 'tv_ip' not in updated:
-            updated['tv_ip'] = devices[0].get('ip', '')
     if name == 'dial_inspect' and result.get('ip'):
         updated['tv_ip'] = result['ip']
         if result.get('friendly_name'):
@@ -66,20 +64,21 @@ def remember_from_result(facts, name, result):
 
 
 ENV_CARD = (
-    'Environment: Termux on Android. Tools you actually have: think, memory_get, memory_set, '
-    'list_files, read_file, write_file, run_shell, run_python, open_url, android_check, '
-    'check_command, pkg_install, local_ipv4, ssdp_discover, lan_scan, lan_probe, '
-    'dial_inspect, dial_launch. There is no tool named shell. pkg_install cannot install pip modules.'
+    'Environment: use live runtime context and the supplied tool schemas. '
+    'Do not assume disabled tools are available. There is no tool named shell. '
+    'pkg_install cannot install pip modules.'
 )
 
 
-def with_memory(goal, facts):
+def with_memory(goal, facts, environment=None):
     lines = [ENV_CARD]
+    if environment is not None:
+        lines.append('Runtime context (observed locally): ' + json.dumps(environment, ensure_ascii=True))
     if facts:
         lines.append('Known facts from earlier runs (verify with tools if the task depends on them):')
         for key, value in facts.items():
             lines.append('- %s: %s' % (key, value))
         if facts.get('tv_youtube_dial') == 'no':
-            lines.append('FACT: GET /apps/YouTube was 404. If the user still asks to open YouTube, call dial_launch once (POST anyway). If POST fails, stop. Do not install Cast stacks.')
+            lines.append('Historical observation: YouTube DIAL was unavailable. This does not establish current status or rule out other control methods.')
     lines.append('User goal: ' + goal)
     return '\n'.join(lines)

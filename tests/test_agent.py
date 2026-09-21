@@ -329,6 +329,23 @@ def test_yes_flag_uses_auto_approval(monkeypatch, tmp_path, capsys):
     assert 'auto-approves' in capsys.readouterr().out.lower()
 
 
+def test_think_and_memory(monkeypatch, tmp_path, tools):
+    import you_agent.memory as mem
+    monkeypatch.setattr(mem, 'MEMORY_PATH', tmp_path / 'memory.json')
+    monkeypatch.setattr(mem, 'CONFIG_DIR', tmp_path)
+    assert tools.execute('think', {'note': 'use ssdp then dial'})['ok']
+    assert tools.execute('memory_set', {'key': 'tv_ip', 'value': '192.168.1.64'})['ok']
+    facts = tools.execute('memory_get', {})['facts']
+    assert facts['tv_ip'] == '192.168.1.64'
+    remembered = mem.remember_from_result({}, 'ssdp_discover', {
+        'ok': True, 'phone_ip': '192.168.1.78',
+        'devices': [{'ip': '192.168.1.64', 'server': 'Chromecast/1.6', 'st': 'urn:dial-multiscreen-org:device:dial:1'}],
+    })
+    assert remembered['tv_ip'] == '192.168.1.64'
+    wrapped = mem.with_memory('open youtube', remembered)
+    assert '192.168.1.64' in wrapped
+
+
 def test_retry_on_520(monkeypatch):
     calls = {'n': 0}
     def urlopen(req, timeout):

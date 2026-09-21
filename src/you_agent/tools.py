@@ -35,6 +35,11 @@ DECLARATIONS = [
                 {"ip": TEXT}, ["ip"]),
     declaration("dial_launch", "POST a DIAL launch to one LAN IPv4 app (YouTube, YouTubeLeanback, Netflix). Requires approval. Not a home-screen tap.",
                 {"ip": TEXT, "app": TEXT}, ["ip", "app"]),
+    declaration("think", "Write a short plan or self-check. Does not change the device.",
+                {"note": TEXT}, ["note"]),
+    declaration("memory_get", "Read saved facts from earlier runs (tv_ip, phone_ip).", {}, []),
+    declaration("memory_set", "Save one short fact for later runs. Key like tv_ip or phone_ip.",
+                {"key": TEXT, "value": TEXT}, ["key", "value"]),
 ]
 
 
@@ -107,6 +112,24 @@ class Tools:
                 return self.dial_inspect(args['ip'])
             if name == 'dial_launch':
                 return self.dial_launch(args['ip'], args['app'])
+            if name == 'think':
+                note = args['note'].strip()
+                if not note or len(note) > 1000:
+                    raise ValueError('think note must be 1 to 1000 characters.')
+                return {'ok': True, 'note': note}
+            if name == 'memory_get':
+                from .memory import load_memory
+                return {'ok': True, 'facts': load_memory()}
+            if name == 'memory_set':
+                from .memory import load_memory, save_memory
+                key = args['key'].strip()[:40]
+                value = args['value'].strip()[:300]
+                if not re.fullmatch(r'[a-z][a-z0-9_]{0,39}', key):
+                    raise ValueError('memory key must be lowercase letters, digits, underscore.')
+                facts = load_memory()
+                facts[key] = value
+                save_memory(facts)
+                return {'ok': True, 'key': key, 'value': value}
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])

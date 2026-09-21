@@ -49,9 +49,12 @@ you doctor --online
 
 ## Use
 
+Short goals are enough. The agent plans, uses built-in tools, and remembers facts like `tv_ip`. It still cannot install packages or skip approvals.
+
 ```sh
 you chat 'Say hi in one short sentence.'
 you run 'Create a hello.py script that prints Hello, then read it back.'
+you run 'Find my TV on Wi-Fi and say if DIAL YouTube works.'
 ```
 
 Writes display the exact content and require typing `yes`. For one run only, pass `--yes` to skip those prompts (scripts are still unsandboxed). There is no permanent auto-approve mode. Workspace default: `~/.local/share/you/workspace`. File contents read by tools are sent to the API.
@@ -71,7 +74,8 @@ Approved Python is **not sandboxed**. Read the displayed code before typing `yes
 - Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`, `dial_inspect`, `dial_launch`; opt-in `run_python`.
 - For LAN IP / nearby devices, the agent should use `local_ipv4` and `ssdp_discover` instead of writing scan scripts. SSDP still misses silent TVs.
 - `dial_inspect` / `dial_launch` talk to one LAN IPv4 via DIAL. A YouTube home-screen icon is not DIAL; HTTP 404 means that app is not exposed.
-- Default: 8 model turns, at most 4 tool calls per turn.
+- Default: 12 model turns, at most 4 tool calls per turn, 40k token threshold.
+- Extra tools: `think`, `memory_get`, `memory_set`. Facts are stored in `~/.local/share/you/memory.json`.
 - API timeout: 90 seconds. HTTP 429 means rate limit; wait and retry. That is not automatically a billing failure.
 - `answered` means the model produced a final response, not independently certified success.
 

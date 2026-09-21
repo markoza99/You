@@ -34,6 +34,7 @@ DECLARATIONS = [
                 {"command": TEXT}, ["command"]),
     declaration("open_url", "Open an http(s) URL on this phone. Tries termux-open-url then am start. Requires approval. Exit code 0 does NOT prove the browser opened.",
                 {"url": TEXT}, ["url"]),
+    declaration("android_check", "Read-only Android/Termux diagnostic: which termux packages and CLIs exist, Android version. Use when a phone action silently does nothing.", {}, []),
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
@@ -140,6 +141,8 @@ class Tools:
                 return self.run_shell(args['command'])
             if name == 'open_url':
                 return self.open_url(args['url'])
+            if name == 'android_check':
+                return self.android_check()
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])
@@ -396,32 +399,71 @@ class Tools:
         if not self.approve('open_url', details):
             return {'ok': False, 'url': url, 'error': 'User denied opening the URL.'}
         attempts = []
-        succeeded = False
+        evidence = False
         if available['termux-open-url']:
             result = self._run_process(['termux-open-url', url])
+            silent = result['ok'] and not result['output'].strip()
             attempts.append({'method': 'termux-open-url', 'exit_code': result['exit_code'],
-                             'output': result['output'][:500], 'error': result['error']})
-            succeeded = result['ok']
-        if not succeeded and available['am']:
+                             'output': result['output'][:500], 'error': result['error'],
+                             'silent_no_output': silent})
+            evidence = result['ok'] and not silent
+        # termux-open-url exits 0 even when the Termux:API app is missing or Android blocked
+        # the launch. When it says nothing, fall through to am, which prints a real
+        # "Starting: Intent" line or an explicit error we can show the user.
+        if not evidence and available['am']:
             result = self._run_process(
                 ['am', 'start', '-a', 'android.intent.action.VIEW', '-d', url])
             output = result['output']
-            # am prints "Error: Activity not started" while still exiting 0 on some ROMs.
             blocked = 'error' in output.lower() or 'not started' in output.lower()
+            started = 'starting:' in output.lower()
             attempts.append({'method': 'am start', 'exit_code': result['exit_code'],
                              'output': output[:500], 'error': result['error'],
-                             'reported_error_text': blocked})
-            succeeded = result['ok'] and not blocked
+                             'reported_error_text': blocked,
+                             'silent_no_output': result['ok'] and not output.strip()})
+            evidence = result['ok'] and started and not blocked
         return {
-            'ok': succeeded,
+            'ok': evidence,
             'url': url,
             'available': available,
             'attempts': attempts,
             'verified': False,
-            'note': ('A zero exit code only means the command ran. Android 11+ silently blocks '
-                     'activity starts from Termux unless Termux is in the foreground or has the '
-                     '"Draw over other apps" permission. Tell the user to look at the screen and '
-                     'confirm; do not claim the browser opened.'),
+            'note': ('ok=true only means a command reported starting the intent. It is still not '
+                     'proof the browser is on screen. If every attempt was silent with no output, '
+                     'the launch was almost certainly swallowed: the Termux:API APP may not be '
+                     'installed (the pkg alone is not enough), or Android 11+ blocked the activity '
+                     'start because Termux lacks "Draw over other apps". Run android_check and tell '
+                     'the user what is missing. Never claim the browser opened.'),
+        }
+
+    def android_check(self):
+        # Fixed read-only commands, no model-supplied arguments, so no approval prompt.
+        packages = self._run_process(
+            ['/bin/sh', '-c', 'pm list packages 2>/dev/null | grep -i termux'])
+        lines = [l.strip() for l in packages['output'].splitlines() if l.strip()]
+        api_app = any('com.termux.api' in l for l in lines)
+        version = self._run_process(
+            ['/bin/sh', '-c', 'getprop ro.build.version.release; getprop ro.build.version.sdk'])
+        release = version['output'].strip().splitlines()
+        cli = {n: bool(shutil.which(n)) for n in
+               ('termux-open-url', 'termux-toast', 'termux-battery-status', 'am', 'pm')}
+        problems = []
+        if not api_app:
+            problems.append('The Termux:API app is NOT installed. "pkg install termux-api" only '
+                            'adds the CLI. Install the Termux:API app from the SAME store as '
+                            'Termux (F-Droid or Play), then retry.')
+        if cli['termux-open-url'] and api_app:
+            problems.append('CLI and app are present. If launching is still silent, Android is '
+                            'blocking the activity start: grant Termux "Display over other apps" '
+                            'in Android settings.')
+        return {
+            'ok': True,
+            'termux_packages': lines,
+            'termux_api_app_installed': api_app,
+            'cli_available': cli,
+            'android_release_and_sdk': release,
+            'problems': problems,
+            'note': 'Read-only check. pm list packages can be empty on some ROMs; an empty list is '
+                    'not proof the app is missing.',
         }
 
     def run_shell(self, command):

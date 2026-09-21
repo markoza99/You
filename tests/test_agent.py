@@ -299,17 +299,46 @@ def test_open_url_denied_does_not_run(monkeypatch, tools):
     assert not result['ok'] and 'denied' in result['error'].lower()
 
 
-def test_open_url_never_claims_verified(monkeypatch, tools):
+def test_open_url_silent_is_not_success(monkeypatch, tools):
     tools.allow_python = True
     monkeypatch.setattr('you_agent.tools.shutil.which',
                         lambda name: '/usr/bin/termux-open-url' if name == 'termux-open-url' else None)
     monkeypatch.setattr(Tools, '_run_process', lambda self, argv: {
         'ok': True, 'exit_code': 0, 'output': '', 'error': None, 'truncated': False})
     result = tools.execute('open_url', {'url': 'https://youtube.com'})
+    assert result['ok'] is False
+    assert result['verified'] is False
+    assert result['attempts'][0]['silent_no_output'] is True
+
+
+def test_open_url_falls_through_to_am_when_silent(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/bin/' + name)
+    calls = []
+    def fake(self, argv):
+        calls.append(argv[0])
+        if argv[0] == 'termux-open-url':
+            return {'ok': True, 'exit_code': 0, 'output': '', 'error': None, 'truncated': False}
+        return {'ok': True, 'exit_code': 0,
+                'output': 'Starting: Intent { act=android.intent.action.VIEW }',
+                'error': None, 'truncated': False}
+    monkeypatch.setattr(Tools, '_run_process', fake)
+    result = tools.execute('open_url', {'url': 'https://youtube.com'})
+    assert calls == ['termux-open-url', 'am']
     assert result['ok'] is True
     assert result['verified'] is False
-    assert 'Draw over other apps' in result['note']
-    assert result['attempts'][0]['method'] == 'termux-open-url'
+
+
+def test_android_check_flags_missing_api_app(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/bin/' + name)
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv: {
+        'ok': True, 'exit_code': 0, 'output': 'package:com.termux\n',
+        'error': None, 'truncated': False})
+    result = tools.execute('android_check', {})
+    assert result['ok'] is True
+    assert result['termux_api_app_installed'] is False
+    assert any('Termux:API app is NOT installed' in p for p in result['problems'])
 
 
 def test_open_url_detects_blocked_am(monkeypatch, tools):

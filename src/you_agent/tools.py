@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import selectors
@@ -26,6 +27,8 @@ def declaration(name, description, properties, required):
 
 TEXT = {"type": "STRING"}
 DECLARATIONS = [
+    declaration("environment_info", "Read actual platform, workspace, enabled tools and command availability. No network, shell execution, or secrets.", {}, []),
+    declaration("tv_capabilities", "Read-only TCP reachability checks on one LAN TV for DIAL, Cast, Android TV remote and legacy ADB. Ports are hints, not verified protocols. Does not pair or launch.", {"ip": TEXT}, ["ip"]),
     declaration("list_files", "List up to 100 entries in a workspace directory.", {"path": TEXT}, ["path"]),
     declaration("read_file", "Read a UTF-8 workspace file, up to 16000 bytes.", {"path": TEXT}, ["path"]),
     declaration("write_file", "Create or overwrite a UTF-8 file, only after user approval.",
@@ -132,6 +135,10 @@ class Tools:
                 args = {k: args[k] for k in fields}
             if any(not isinstance(v, str) for v in args.values()):
                 raise ValueError("Tool arguments must be strings.")
+            if name == 'environment_info':
+                return self.environment_info()
+            if name == 'tv_capabilities':
+                return self.tv_capabilities(args['ip'])
             if name == 'local_ipv4':
                 return self.local_ipv4()
             if name == 'ssdp_discover':
@@ -197,7 +204,7 @@ class Tools:
                 if self.secret and self.secret in args['content']:
                     raise ValueError("Refusing to write the API key.")
                 if not self.approve('write_file', dict(args)):
-                    return {"ok": False, "error": "User denied file write."}
+                    return {'denied': True, 'stop': True, 'error_kind': 'user_denied', "ok": False, "error": "User denied file write."}
                 path = self.path(args['path'])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(content)
@@ -211,12 +218,52 @@ class Tools:
                        "cwd": str(self.root), "timeout_seconds": self.timeout,
                        "warning": "NOT SANDBOXED: can access Termux files/network and change or delete data."}
             if not self.approve('run_python', details):
-                return {"ok": False, "error": "User denied Python execution."}
+                return {'denied': True, 'stop': True, 'error_kind': 'user_denied', "ok": False, "error": "User denied Python execution."}
             if self.path(args['path']).read_bytes() != code:
                 raise ValueError("Script changed after approval; refusing execution.")
             return self.run_python(path)
         except (OSError, ValueError, UnicodeError) as exc:
             return {"ok": False, "error": self.redact(str(exc))[:1000]}
+
+    def environment_info(self):
+        return {
+            'ok': True,
+            'platform': platform.system(),
+            'machine': platform.machine(),
+            'python_version': platform.python_version(),
+            'termux_detected': 'com.termux' in os.environ.get('PREFIX', ''),
+            'workspace': str(self.root),
+            'code_execution_enabled': self.allow_python,
+            'enabled_tools': [d['name'] for d in self.declarations],
+            'commands': {name: shutil.which(name) for name in
+                         ('bash', 'pkg', 'adb', 'curl', 'python', 'termux-open-url')},
+            'note': 'Command presence does not prove functionality or permission. No network discovery has run.',
+        }
+
+    def tv_capabilities(self, ip):
+        self._lan_peer(ip)
+        if int(ip.split('.')[-1]) in (0, 255):
+            raise ValueError('Target must be a unicast LAN host.')
+        candidates = ((8008, 'DIAL/HTTP'), (8009, 'Google Cast'),
+                      (6466, 'Android TV remote'), (6467, 'Android TV pairing'),
+                      (5555, 'Legacy ADB'))
+        def probe(candidate):
+            port, hint = candidate
+            try:
+                with socket.create_connection((ip, port), timeout=1.5):
+                    return {'port': port, 'protocol_hint': hint, 'reachable': True}
+            except OSError as exc:
+                return {'port': port, 'protocol_hint': hint, 'reachable': False,
+                        'error': str(exc)[:200]}
+        with ThreadPoolExecutor(max_workers=len(candidates)) as pool:
+            ports = list(pool.map(probe, candidates))
+        return {
+            'ok': True, 'ip': ip, 'ports': ports, 'protocols_verified': False,
+            'adb_client_available': bool(shutil.which('adb')),
+            'note': 'Open ports do not prove protocol support, pairing, authorization, or app availability. '
+                    'Closed ports do not rule out services on other ports (including wireless ADB). '
+                    'No launch, pairing, authentication or debugging changes were attempted.',
+        }
 
     def local_ipv4(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -584,7 +631,7 @@ class Tools:
             'warning': 'Sends HTTP POST to this LAN TV. GET 404 does not skip POST. Look at the TV.',
         }
         if not self.approve('dial_launch', details):
-            return {'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
         attempts = []
         for name in names:
             path = urlparse(urljoin(app_base, name)).path or '/'
@@ -615,11 +662,13 @@ class Tools:
             'launch_body': last.get('launch_body', ''),
             'attempts': attempts,
             'inspect': inspect,
-            'stop': True,
-            'error': 'DIAL POST failed for %s. GET 404 plus POST failure means this TV will not '
-                     'open YouTube from Termux. Use the TV remote or Cast from the phone YouTube app. '
-                     'Do not install pychromecast.' % ', '.join(names),
-            'note': 'Tried anyway. Quote attempts. Do not retry the same launch.',
+            'stop': False,
+            'error_kind': 'dial_launch_failed',
+            'recoverable': True,
+            'failed_method': 'DIAL',
+            'error': 'DIAL POST failed for %s. Other control methods have not been tested.' % ', '.join(names),
+            'next_tool': {'name': 'tv_capabilities', 'arguments': {'ip': ip}},
+            'note': 'Quote attempts. Do not repeat this launch. Discover other capabilities before selecting another method.',
         }
 
     # Catastrophic patterns refused before the approval prompt. This is a guardrail
@@ -656,7 +705,7 @@ class Tools:
             'warning': 'NOT SANDBOXED: launches an Android intent as your Termux user.',
         }
         if not self.approve('open_url', details):
-            return {'ok': False, 'url': url, 'error': 'User denied opening the URL.'}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'url': url, 'error': 'User denied opening the URL.'}
         attempts = []
         evidence = False
         if available['termux-open-url']:
@@ -822,7 +871,7 @@ class Tools:
             'warning': 'Installs software on this phone as your Termux user.',
         }
         if not self.approve('pkg_install', details):
-            return {'ok': False, 'package': mapped, 'error': 'User denied package install.'}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'package': mapped, 'error': 'User denied package install.'}
         result = self._run_process(['pkg', 'install', '-y', mapped],
                                    timeout=self.install_timeout)
         output = result.get('output', '')
@@ -857,7 +906,7 @@ class Tools:
             'warning': 'NOT SANDBOXED: runs with your Termux user access and can change or delete data.',
         }
         if not self.approve('run_shell', details):
-            return {'ok': False, 'error': 'User denied shell execution.', 'command': command}
+            return {'denied': True, 'stop': True, 'error_kind': 'user_denied', 'ok': False, 'error': 'User denied shell execution.', 'command': command}
         shell = shutil.which('bash') or '/bin/sh'
         result = self._run_process([shell, '-c', command])
         result['command'] = command

@@ -142,7 +142,7 @@ def test_dial_inspect_youtube_404(monkeypatch, tools):
     assert result['apps'][0]['status'] == 404
 
 
-def test_dial_launch_stops_when_youtube_404(monkeypatch, tools):
+def test_dial_launch_allows_recovery_when_youtube_404(monkeypatch, tools):
     class FakeSock:
         def connect(self, addr):
             pass
@@ -174,7 +174,8 @@ def test_dial_launch_stops_when_youtube_404(monkeypatch, tools):
     monkeypatch.setattr('you_agent.tools.http.client.HTTPConnection', FakeHTTP)
     result = tools.execute('dial_launch', {'ip': '192.168.1.64', 'app': 'YouTube'})
     assert not result['ok']
-    assert result.get('stop') is True
+    assert result.get('stop') is False
+    assert result['recoverable'] is True
     assert result.get('attempts')
     assert any(a.get('launch_status') == 404 for a in result['attempts'])
 
@@ -565,7 +566,8 @@ def test_with_memory_includes_environment_and_hard_fact():
     from you_agent.memory import with_memory
     text = with_memory('open youtube on tv', {'tv_ip': '192.168.1.64', 'tv_youtube_dial': 'no'})
     assert 'no tool named shell' in text.lower() or 'There is no tool named shell' in text
-    assert 'dial_launch' in text
+    assert 'does not establish current status or rule out other control methods' in text
+    assert 'If POST fails, stop' not in text
     assert 'User goal: open youtube on tv' in text
 
 
@@ -763,7 +765,8 @@ def test_openai_tool_schema(tools):
     schema = tools.openai_tools
     assert schema[0]['type'] == 'function'
     assert schema[0]['function']['parameters']['type'] == 'object'
-    assert schema[0]['function']['parameters']['properties']['path']['type'] == 'string'
+    listing = next(item for item in schema if item['function']['name'] == 'list_files')
+    assert listing['function']['parameters']['properties']['path']['type'] == 'string'
 
 
 def test_auto_approval():

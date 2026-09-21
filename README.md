@@ -68,8 +68,9 @@ Approved Python is **not sandboxed**. Read the displayed code before typing `yes
 
 ## Limits
 
-- Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`; opt-in `run_python`.
+- Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`, `dial_inspect`, `dial_launch`; opt-in `run_python`.
 - For LAN IP / nearby devices, the agent should use `local_ipv4` and `ssdp_discover` instead of writing scan scripts. SSDP still misses silent TVs.
+- `dial_inspect` / `dial_launch` talk to one LAN IPv4 via DIAL. A YouTube home-screen icon is not DIAL; HTTP 404 means that app is not exposed.
 - Default: 8 model turns, at most 4 tool calls per turn.
 - API timeout: 90 seconds. HTTP 429 means rate limit; wait and retry. That is not automatically a billing failure.
 - `answered` means the model produced a final response, not independently certified success.

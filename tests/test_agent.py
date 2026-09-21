@@ -86,6 +86,94 @@ def test_ssdp_same_subnet_only(monkeypatch, tools):
     assert result['devices'] == []
 
 
+def test_dial_rejects_other_subnet(monkeypatch, tools):
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    result = tools.execute('dial_inspect', {'ip': '10.0.0.5'})
+    assert not result['ok']
+
+
+def test_dial_inspect_youtube_404(monkeypatch, tools):
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def close(self):
+            pass
+
+    class FakeHTTP:
+        def __init__(self, host, port, timeout=None):
+            self.path = None
+        def request(self, method, path, headers=None, body=None):
+            self.path = path
+        def getresponse(self):
+            path = self.path
+            class Resp:
+                def getheaders(self_inner):
+                    return [('Application-URL', 'http://192.168.1.64:8008/apps/')]
+                def read(self_inner, n=None):
+                    if path.endswith('device-desc.xml'):
+                        self_inner.status = 200
+                        return b'<root><device><friendlyName>Android TV</friendlyName><manufacturer>SWTV</manufacturer><modelName>SWTV</modelName></device></root>'
+                    self_inner.status = 404
+                    return b''
+            resp = Resp()
+            if path.endswith('device-desc.xml'):
+                resp.status = 200
+            else:
+                resp.status = 404
+            return resp
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    monkeypatch.setattr('you_agent.tools.http.client.HTTPConnection', FakeHTTP)
+    result = tools.execute('dial_inspect', {'ip': '192.168.1.64'})
+    assert result['ok']
+    assert result['friendly_name'] == 'Android TV'
+    assert result['youtube_dial_available'] is False
+    assert result['apps'][0]['status'] == 404
+
+
+def test_dial_launch_denied(monkeypatch, tools):
+    tools.approve = lambda *_: False
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def close(self):
+            pass
+    class FakeHTTP:
+        def __init__(self, host, port, timeout=None):
+            self.path = None
+        def request(self, method, path, headers=None, body=None):
+            self.path = path
+            self.method = method
+        def getresponse(self):
+            class Resp:
+                status = 200
+                def getheaders(self_inner):
+                    return [('Application-URL', 'http://192.168.1.64:8008/apps/')]
+                def read(self_inner, n=None):
+                    return b'<root><device><friendlyName>Android TV</friendlyName><manufacturer>SWTV</manufacturer><modelName>SWTV</modelName></device></root>'
+            if getattr(self, 'method', 'GET') == 'POST':
+                raise AssertionError('launch POST must not run when denied')
+            return Resp()
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    monkeypatch.setattr('you_agent.tools.http.client.HTTPConnection', FakeHTTP)
+    result = tools.execute('dial_launch', {'ip': '192.168.1.64', 'app': 'YouTube'})
+    assert not result['ok']
+
+
 def test_redaction(tools):
     tools.secret = 'test-secret'
     (tools.root / 'a').write_text('a test-secret b')

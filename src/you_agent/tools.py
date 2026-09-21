@@ -1,14 +1,17 @@
 """Workspace tools. Path controls are not isolation for approved Python code."""
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import signal
 import socket
 import subprocess
 import sys
 import time
+from urllib.parse import urljoin, urlparse
 
 LIMIT = 16000
 
@@ -28,6 +31,10 @@ DECLARATIONS = [
                 {"path": TEXT}, ["path"]),
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
+    declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
+                {"ip": TEXT}, ["ip"]),
+    declaration("dial_launch", "POST a DIAL launch to one LAN IPv4 app (YouTube, YouTubeLeanback, Netflix). Requires approval. Not a home-screen tap.",
+                {"ip": TEXT, "app": TEXT}, ["ip", "app"]),
 ]
 
 
@@ -96,6 +103,10 @@ class Tools:
                 return self.local_ipv4()
             if name == 'ssdp_discover':
                 return self.ssdp_discover()
+            if name == 'dial_inspect':
+                return self.dial_inspect(args['ip'])
+            if name == 'dial_launch':
+                return self.dial_launch(args['ip'], args['app'])
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])
@@ -208,6 +219,112 @@ class Tools:
             "devices": list(found.values()),
             "count": len(found),
             "note": "SSDP only lists devices that answer multicast. A silent Android TV often will not appear. Use the TV network page or router DHCP list.",
+        }
+
+    def _lan_peer(self, ip):
+        info = self.local_ipv4()
+        if not info.get('ok'):
+            raise ValueError(info.get('error') or 'Could not detect this phone LAN IP.')
+        local = info['ip']
+        if not re.fullmatch(r'(?:\d{1,3}\.){3}\d{1,3}', ip):
+            raise ValueError('ip must be IPv4 dotted decimal.')
+        if any(int(p) > 255 for p in ip.split('.')):
+            raise ValueError('Invalid IPv4 address.')
+        if ip.split('.')[:3] != local.split('.')[:3]:
+            raise ValueError('Target is not on this phone /24.')
+        if ip in (local, '127.0.0.1', '0.0.0.0'):
+            raise ValueError('Target must be another host on this LAN.')
+        return local
+
+    def _http_get(self, host, port, path, extra_headers=None):
+        headers = {'Accept': '*/*', 'User-Agent': 'You-Termux-Agent/0.2 DIAL'}
+        if extra_headers:
+            headers.update(extra_headers)
+        conn = http.client.HTTPConnection(host, port, timeout=8)
+        try:
+            conn.request('GET', path, headers=headers)
+            response = conn.getresponse()
+            body = response.read(LIMIT + 1)
+            header_map = {k.lower(): v for k, v in response.getheaders()}
+            return response.status, header_map, body[:LIMIT].decode('utf-8', errors='replace')
+        finally:
+            conn.close()
+
+    def _xml_tag(self, xml, tag):
+        match = re.search(r'<%s(?:\s[^>]*)?>([^<]+)</%s>' % (tag, tag), xml, re.I)
+        return match.group(1).strip() if match else ''
+
+    def dial_inspect(self, ip):
+        self._lan_peer(ip)
+        status, headers, body = self._http_get(ip, 8008, '/ssdp/device-desc.xml')
+        app_base = (headers.get('application-url') or '').rstrip('/') + '/'
+        parsed = urlparse(app_base) if app_base != '/' else None
+        if not parsed or parsed.scheme != 'http' or parsed.hostname != ip:
+            app_base = 'http://%s:8008/apps/' % ip
+            parsed = urlparse(app_base)
+        names = ['YouTube', 'YouTubeLeanback', 'YouTubeTV']
+        apps = []
+        for name in names:
+            path = urlparse(urljoin(app_base, name)).path or '/'
+            try:
+                app_status, _, app_body = self._http_get(parsed.hostname, parsed.port or 8008, path)
+            except OSError as exc:
+                apps.append({'name': name, 'status': None, 'error': str(exc)[:200]})
+                continue
+            apps.append({'name': name, 'status': app_status, 'body': app_body[:500]})
+        youtube_ok = any(a.get('status') in (200, 201, 204) for a in apps)
+        return {
+            'ok': status == 200,
+            'ip': ip,
+            'description_status': status,
+            'friendly_name': self._xml_tag(body, 'friendlyName'),
+            'manufacturer': self._xml_tag(body, 'manufacturer'),
+            'model': self._xml_tag(body, 'modelName'),
+            'application_url': app_base,
+            'youtube_dial_available': youtube_ok,
+            'apps': apps,
+            'note': 'A YouTube icon on the TV home screen is not DIAL. 404 means this TV does not expose that DIAL app. Do not claim launch succeeded.',
+        }
+
+    def dial_launch(self, ip, app):
+        self._lan_peer(ip)
+        allowed = {'YouTube', 'YouTubeLeanback', 'YouTubeTV', 'Netflix'}
+        if app not in allowed:
+            raise ValueError('app must be one of: ' + ', '.join(sorted(allowed)))
+        inspect = self.dial_inspect(ip)
+        app_base = inspect['application_url']
+        parsed = urlparse(app_base)
+        path = urlparse(urljoin(app_base, app)).path or '/'
+        details = {
+            'ip': ip,
+            'app': app,
+            'url': 'http://%s:%s%s' % (parsed.hostname, parsed.port or 8008, path),
+            'friendly_name': inspect.get('friendly_name', ''),
+            'warning': 'Sends HTTP POST to this LAN TV only. Home-screen YouTube may still ignore DIAL.',
+        }
+        if not self.approve('dial_launch', details):
+            return {'ok': False, 'error': 'User denied DIAL launch.', 'inspect': inspect}
+        conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 8008, timeout=8)
+        try:
+            conn.request('POST', path, body=b'', headers={
+                'Content-Type': 'text/plain; charset="utf-8"',
+                'Origin': 'https://www.youtube.com',
+                'User-Agent': 'You-Termux-Agent/0.2 DIAL',
+            })
+            response = conn.getresponse()
+            body = response.read(LIMIT)
+            launch_status = response.status
+            launch_body = body.decode('utf-8', errors='replace')[:500]
+        finally:
+            conn.close()
+        return {
+            'ok': launch_status in (200, 201, 204),
+            'ip': ip,
+            'app': app,
+            'launch_status': launch_status,
+            'launch_body': launch_body,
+            'inspect': inspect,
+            'note': 'HTTP 201/200/204 means the DIAL server accepted the launch. The TV home-screen app can still stay closed.',
         }
 
     def run_python(self, path):

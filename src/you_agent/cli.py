@@ -19,6 +19,7 @@ Do not create background processes. Keep tasks short and within the workspace.
 Only report file contents after a successful read_file tool result. Do not invent tool results.
 For this phone LAN IP or nearby devices, call local_ipv4 and ssdp_discover. Do not write scan scripts unless those tools fail.
 Do not treat 0.0.0.0 or 127.0.0.1 as the phone address.
+To inspect or launch a DIAL app on one LAN TV, call dial_inspect then dial_launch. A home-screen YouTube icon is not DIAL. HTTP 404 means that DIAL app is missing; do not invent a successful launch.
 '''
 
 
@@ -128,7 +129,7 @@ def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=
             extra = ''
             if name == 'run_python' and result.get('output'):
                 extra = '\n' + result['output'][:2000]
-            elif name in ('local_ipv4', 'ssdp_discover') and result.get('ok'):
+            elif name in ('local_ipv4', 'ssdp_discover', 'dial_inspect', 'dial_launch'):
                 extra = '\n' + json.dumps(result, ensure_ascii=True)[:2000]
             elif not result.get('ok') and result.get('error'):
                 extra = ' (' + str(result['error'])[:200] + ')'

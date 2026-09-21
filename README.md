@@ -65,13 +65,19 @@ Writes display the exact content and require typing `yes`. For one run only, pas
 
 ```sh
 you run --allow-python 'Create hello.py, run it, and verify its output.'
+you run --allow-python 'Open youtube.com in the phone browser.'
 ```
 
-Approved Python is **not sandboxed**. Read the displayed code before typing `yes`.
+Approved Python and shell are **not sandboxed**. Read the displayed code or command before typing `yes`.
+
+Opening a URL needs Termux:API (`pkg install termux-api` plus the Termux:API app from the same store as Termux). Without it, `termux-open-url` is missing and the agent will fall back to `am start`; if that is also blocked it will say so instead of claiming success.
 
 ## Limits
 
-- Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`, `dial_inspect`, `dial_launch`; opt-in `run_python`.
+- Tools: `list_files`, `read_file`, `write_file`, `local_ipv4`, `ssdp_discover`, `dial_inspect`, `dial_launch`; opt-in `run_python` and `run_shell`.
+- `run_shell` runs one Termux command (`am`, `termux-open-url`, `pkg`, `ping`, `curl`). It is enabled by the same `--allow-python` / `--allow-exec` flag, because approved Python can already spawn a shell. Every command is shown before it runs.
+- A few catastrophic patterns (`rm -rf /`, `mkfs`, fork bombs) are refused before the prompt. That is a guardrail against a careless model, **not** a security boundary.
+- On failure the agent is told to read the error and try a different approach, up to about 5 real attempts, instead of stopping at the first error.
 - For LAN IP / nearby devices, the agent should use `local_ipv4` and `ssdp_discover` instead of writing scan scripts. SSDP still misses silent TVs.
 - `dial_inspect` / `dial_launch` talk to one LAN IPv4 via DIAL. A YouTube home-screen icon is not DIAL; HTTP 404 means that app is not exposed.
 - Default: 12 model turns, at most 4 tool calls per turn, 40k token threshold.

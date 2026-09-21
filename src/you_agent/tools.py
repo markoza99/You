@@ -29,6 +29,8 @@ DECLARATIONS = [
                 {"path": TEXT, "content": TEXT}, ["path", "content"]),
     declaration("run_python", "Run a workspace Python script after explicit approval. NOT sandboxed.",
                 {"path": TEXT}, ["path"]),
+    declaration("run_shell", "Run one shell command in Termux after explicit approval. Use for am, termux-open-url, pkg, ls, ping. NOT sandboxed.",
+                {"command": TEXT}, ["command"]),
     declaration("local_ipv4", "Detect this device LAN IPv4 (not 127.0.0.1, not 0.0.0.0). No extra packages.", {}, []),
     declaration("ssdp_discover", "SSDP M-SEARCH on this LAN /24 only, up to 5 seconds. Prefer this over writing a scan script.", {}, []),
     declaration("dial_inspect", "Read DIAL/UPnP description and YouTube app status on one LAN IPv4. Uses Application-URL. Does not launch.",
@@ -54,7 +56,8 @@ class Tools:
 
     @property
     def declarations(self):
-        return [d for d in DECLARATIONS if self.allow_python or d['name'] != 'run_python']
+        return [d for d in DECLARATIONS
+                if self.allow_python or d['name'] not in ('run_python', 'run_shell')]
 
     @property
     def openai_tools(self):
@@ -130,6 +133,8 @@ class Tools:
                 facts[key] = value
                 save_memory(facts)
                 return {'ok': True, 'key': key, 'value': value}
+            if name == 'run_shell':
+                return self.run_shell(args['command'])
             if len(args['path']) > 512:
                 raise ValueError("Path too long.")
             path = self.path(args['path'])
@@ -350,10 +355,50 @@ class Tools:
             'note': 'HTTP 201/200/204 means the DIAL server accepted the launch. The TV home-screen app can still stay closed.',
         }
 
+    # Catastrophic patterns refused before the approval prompt. This is a guardrail
+    # against a careless model, NOT a security boundary: approved shell is arbitrary code.
+    REFUSED_SHELL = (
+        r'rm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rf][a-zA-Z]*\s+(-[a-zA-Z]+\s+)*/\s*($|;|&)',
+        r'mkfs(\.|\s)',
+        r'dd\s+[^|]*of=/dev/(block|sd|mmc)',
+        r':\(\)\s*\{.*\};\s*:',
+        r'>\s*/dev/(block|sd|mmc)',
+        r'chmod\s+-R\s+777\s+/\s*($|;|&)',
+    )
+
+    def run_shell(self, command):
+        command = command.strip()
+        if not command:
+            raise ValueError('Empty shell command.')
+        if len(command) > 4000:
+            raise ValueError('Shell command exceeds 4000 characters.')
+        if '\x00' in command:
+            raise ValueError('Shell command contains a null byte.')
+        if self.secret and self.secret in command:
+            raise ValueError('Refusing to run a command containing the API key.')
+        for pattern in self.REFUSED_SHELL:
+            if re.search(pattern, command, re.I):
+                return {'ok': False, 'error': 'Refused: command matches a catastrophic pattern.',
+                        'command': command}
+        details = {
+            'command': command,
+            'cwd': str(self.root),
+            'timeout_seconds': self.timeout,
+            'warning': 'NOT SANDBOXED: runs with your Termux user access and can change or delete data.',
+        }
+        if not self.approve('run_shell', details):
+            return {'ok': False, 'error': 'User denied shell execution.', 'command': command}
+        result = self._run_process(['/bin/sh', '-c', command])
+        result['command'] = command
+        return result
+
     def run_python(self, path):
+        return self._run_process([sys.executable, '-I', str(path)])
+
+    def _run_process(self, argv):
         # Minimal inherited environment; never pass API keys to the child.
         env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'LANG', 'PREFIX') if k in os.environ}
-        process = subprocess.Popen([sys.executable, '-I', str(path)], cwd=self.root,
+        process = subprocess.Popen(argv, cwd=self.root,
                                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)
         captured = bytearray()

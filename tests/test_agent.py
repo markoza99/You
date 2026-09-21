@@ -217,6 +217,63 @@ def test_output_cap(tools):
     assert not result['ok'] and result['truncated'] and len(result['output']) <= LIMIT
 
 
+def test_shell_hidden_unless_allowed(tools):
+    names = [d['name'] for d in tools.declarations]
+    assert 'run_shell' not in names
+    assert not tools.execute('run_shell', {'command': 'echo hi'})['ok']
+    tools.allow_python = True
+    assert 'run_shell' in [d['name'] for d in tools.declarations]
+
+
+def test_shell_runs_and_captures_output(tools):
+    tools.allow_python = True
+    result = tools.execute('run_shell', {'command': 'echo hello-shell'})
+    assert result['ok'] and result['exit_code'] == 0
+    assert 'hello-shell' in result['output']
+
+
+def test_shell_reports_failure_for_missing_command(tools):
+    tools.allow_python = True
+    result = tools.execute('run_shell', {'command': 'this-command-does-not-exist-xyz'})
+    assert not result['ok'] and result['exit_code'] != 0
+
+
+def test_shell_denied_does_not_run(tools):
+    tools.allow_python = True
+    tools.approve = lambda *_: False
+    result = tools.execute('run_shell', {'command': 'touch unwanted-shell'})
+    assert not result['ok']
+    assert not (tools.root / 'unwanted-shell').exists()
+
+
+@pytest.mark.parametrize('command', ['rm -rf /', 'mkfs.ext4 /dev/block/sda', ':(){ :|:& };:'])
+def test_shell_refuses_catastrophic(tools, command):
+    tools.allow_python = True
+    called = {'n': 0}
+    def approve(*_):
+        called['n'] += 1
+        return True
+    tools.approve = approve
+    result = tools.execute('run_shell', {'command': command})
+    assert not result['ok'] and 'catastrophic' in result['error']
+    assert called['n'] == 0
+
+
+def test_shell_refuses_command_with_secret(tools):
+    tools.allow_python = True
+    tools.secret = 'sk-secret-value'
+    result = tools.execute('run_shell', {'command': 'curl -H "key: sk-secret-value" x'})
+    assert not result['ok']
+    assert 'sk-secret-value' not in json.dumps(result)
+
+
+def test_shell_timeout(tools):
+    tools.allow_python = True
+    tools.timeout = 0.2
+    result = tools.execute('run_shell', {'command': 'sleep 5'})
+    assert not result['ok'] and 'timed out' in result['error']
+
+
 def test_changed_after_approval(tools):
     tools.allow_python = True
     (tools.root / 'a.py').write_text('print(1)')

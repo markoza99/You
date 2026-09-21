@@ -13,11 +13,23 @@ SYSTEM = '''You are You, a personal Termux agent. The user gives a short goal. Y
 
 How to work:
 - Call think with a short plan before tools when the goal is more than one step.
-- Prefer built-in tools over writing Python. Do not pip/pkg install. Do not invent tools.
+- NEVER ask the user for permission in text. The program shows its own approval prompt.
+  If you want to run something, call the tool. Asking in prose does nothing and wastes the run.
+- run_shell runs one Termux command (am, termux-open-url, pkg, ls, ping, curl). Use it instead of
+  writing a .sh file: you cannot execute .sh with run_python.
+- Keep trying. If a tool fails, read the error, change the command, and try another way.
+  Make up to 5 real attempts with different approaches before you give up.
+  Never repeat the identical failing call twice in a row.
+- If a needed program is missing, you may propose one install with run_shell (pkg install ...).
+  The user still approves it. Do not install anything unrelated to the goal.
+- Prefer built-in tools over writing scripts. Do not invent tools that are not listed.
 - Use memory_get if the goal refers to earlier facts (TV IP, phone IP). Use memory_set for durable facts.
 - Tool JSON is the only evidence. Quote it. Never invent hosts, files, or HTTP success.
-- If a tool fails, change approach once, then stop and explain the blocker.
-- Writes, Python, and dial_launch need user approval. If denied, stop. Do not bypass.
+- Writes, run_python, run_shell, and dial_launch need user approval. If the user denies, stop.
+  Do not retry a denied action or work around the denial.
+- Android: Termux cannot tap other apps. To open a URL on this phone try
+  termux-open-url, then am start -a android.intent.action.VIEW -d <url>.
+  If both fail, say so plainly instead of claiming it opened.
 - Do not scan the internet or other subnets. LAN tools stay on this phone /24.
 - 0.0.0.0 and 127.0.0.1 are not the phone address.
 - TV / Cast: ssdp_discover or remembered tv_ip, then dial_inspect, then dial_launch only if youtube_dial_available is true. A YouTube home-screen icon is not DIAL. HTTP 404 means DIAL YouTube is not exposed; say that and stop.
@@ -43,8 +55,8 @@ def approval(name, details):
 
 
 def auto_approval(name, details):
-    path = details.get('path', '')
-    safe_print('Auto-approved for this run: %s %s' % (name, path))
+    target = details.get('path') or details.get('command') or details.get('app') or ''
+    safe_print('Auto-approved for this run: %s %s' % (name, str(target)[:300]))
     return True
 
 
@@ -92,7 +104,7 @@ def parse_tool_arguments(raw):
     return parsed
 
 
-def run_agent(provider, tools, goal, max_steps=12, max_tokens=40000, max_seconds=240):
+def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds=240):
     if not goal.strip() or len(goal) > 16000:
         raise ValueError('Goal must be between 1 and 16000 characters.')
     if min(max_steps, max_tokens, max_seconds) <= 0:
@@ -139,7 +151,7 @@ def run_agent(provider, tools, goal, max_steps=12, max_tokens=40000, max_seconds
                 facts = load_memory()
             status = 'ok' if result.get('ok') else 'failed/denied'
             extra = ''
-            if name == 'run_python' and result.get('output'):
+            if name in ('run_python', 'run_shell') and result.get('output'):
                 extra = '\n' + result['output'][:2000]
             elif name in ('local_ipv4', 'ssdp_discover', 'dial_inspect', 'dial_launch', 'think', 'memory_get', 'memory_set'):
                 extra = '\n' + json.dumps(result, ensure_ascii=True)[:2000]
@@ -169,9 +181,10 @@ def main(argv=None):
     chat.add_argument('prompt')
     run = commands.add_parser('run', help='Run a bounded goal with workspace tools')
     run.add_argument('goal')
-    run.add_argument('--allow-python', action='store_true', help='Expose unsandboxed Python tool; each execution still asks approval unless --yes')
-    run.add_argument('--yes', action='store_true', help='Approve writes and Python for THIS run only. Not a permanent auto-approve mode.')
-    run.add_argument('--max-steps', type=int, default=12)
+    run.add_argument('--allow-python', '--allow-exec', dest='allow_python', action='store_true',
+                     help='Expose unsandboxed run_python and run_shell; each execution still asks approval unless --yes')
+    run.add_argument('--yes', action='store_true', help='Approve writes, Python, and shell for THIS run only. Not a permanent auto-approve mode.')
+    run.add_argument('--max-steps', type=int, default=16)
     run.add_argument('--max-tokens', type=int, default=40000)
     run.add_argument('--max-seconds', type=int, default=240)
     args = parser.parse_args(argv)

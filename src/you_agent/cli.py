@@ -37,6 +37,12 @@ def approval(name, details):
         return False
 
 
+def auto_approval(name, details):
+    path = details.get('path', '')
+    safe_print('Auto-approved for this run: %s %s' % (name, path))
+    return True
+
+
 def api_key():
     return os.environ.get('YOU_API_KEY') or os.environ.get('VYCEAI_API_KEY') or os.environ.get('GEMINI_API_KEY', '')
 
@@ -60,13 +66,15 @@ def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=
     if min(max_steps, max_tokens, max_seconds) <= 0:
         raise ValueError('All limits must be positive.')
     messages = [{'role': 'user', 'content': goal}]
-    started = time.monotonic()
+    used = 0.0
     total = 0
     openai_tools = tools.openai_tools if hasattr(tools, 'openai_tools') else None
     for step in range(max_steps):
-        if time.monotonic() - started >= max_seconds:
+        if used >= max_seconds:
             return {'status': 'limit_reached', 'reason': 'Runtime limit', 'tokens': total}
+        started = time.monotonic()
         message, usage = provider.generate(messages, SYSTEM, openai_tools)
+        used += time.monotonic() - started
         total += int(usage.get('totalTokenCount', 0))
         messages.append(message)
         if total >= max_tokens:
@@ -80,8 +88,6 @@ def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=
         if len(calls) > 4:
             return {'status': 'limit_reached', 'reason': 'Too many tool calls in one response', 'tokens': total}
         for call in calls:
-            if time.monotonic() - started >= max_seconds:
-                return {'status': 'limit_reached', 'reason': 'Runtime limit', 'tokens': total}
             function = call.get('function') or {}
             name = function.get('name', '')
             try:
@@ -89,7 +95,13 @@ def run_agent(provider, tools, goal, max_steps=8, max_tokens=24000, max_seconds=
                 result = tools.execute(name, args)
             except (ValueError, TypeError, json.JSONDecodeError) as exc:
                 result = {'ok': False, 'error': str(exc)[:1000]}
-            safe_print('Tool ' + name + ': ' + ('ok' if result.get('ok') else 'failed/denied'))
+            status = 'ok' if result.get('ok') else 'failed/denied'
+            extra = ''
+            if name == 'run_python' and result.get('output'):
+                extra = '\n' + result['output'][:2000]
+            elif not result.get('ok') and result.get('error'):
+                extra = ' (' + str(result['error'])[:200] + ')'
+            safe_print('Tool ' + name + ': ' + status + extra)
             messages.append({
                 'role': 'tool',
                 'tool_call_id': call.get('id') or name,
@@ -110,7 +122,8 @@ def main(argv=None):
     chat.add_argument('prompt')
     run = commands.add_parser('run', help='Run a bounded goal with workspace tools')
     run.add_argument('goal')
-    run.add_argument('--allow-python', action='store_true', help='Expose unsandboxed Python tool; each execution still asks approval')
+    run.add_argument('--allow-python', action='store_true', help='Expose unsandboxed Python tool; each execution still asks approval unless --yes')
+    run.add_argument('--yes', action='store_true', help='Approve writes and Python for THIS run only. Not a permanent auto-approve mode.')
     run.add_argument('--max-steps', type=int, default=8)
     run.add_argument('--max-tokens', type=int, default=24000)
     run.add_argument('--max-seconds', type=int, default=180)
@@ -144,7 +157,10 @@ def main(argv=None):
             text = (message.get('content') or '')
             safe_print(text.replace(key, '[REDACTED]') if key else text)
             return 0
-        tools = Tools(args.workspace, approval, args.allow_python, key)
+        decide = auto_approval if args.yes else approval
+        if args.yes:
+            safe_print('Warning: --yes auto-approves writes and Python for this run only. Scripts are not sandboxed.')
+        tools = Tools(args.workspace, decide, args.allow_python, key)
         result = run_agent(provider, tools, args.goal, args.max_steps, args.max_tokens, args.max_seconds)
         safe_print(result.get('text', result.get('reason', '')))
         safe_print('Status: %s | reported tokens: %s' % (result['status'], result['tokens']))

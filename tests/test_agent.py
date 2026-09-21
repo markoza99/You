@@ -5,7 +5,7 @@ from urllib.error import HTTPError
 
 import pytest
 from you_agent.tools import Tools, LIMIT
-from you_agent.cli import run_agent, main, approval
+from you_agent.cli import run_agent, main, approval, auto_approval
 from you_agent.provider import Provider, ProviderError
 
 
@@ -182,3 +182,32 @@ def test_openai_tool_schema(tools):
     assert schema[0]['type'] == 'function'
     assert schema[0]['function']['parameters']['type'] == 'object'
     assert schema[0]['function']['parameters']['properties']['path']['type'] == 'string'
+
+
+def test_auto_approval():
+    assert auto_approval('write_file', {'path': 'a.py'}) is True
+
+
+def test_yes_flag_uses_auto_approval(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv('YOU_API_KEY', 'fake')
+    class FakeProv:
+        def generate(self, messages, system, tools=None):
+            return {'role': 'assistant', 'content': 'done'}, {'totalTokenCount': 1}
+    monkeypatch.setattr('you_agent.cli.Provider', lambda *a, **k: FakeProv())
+    assert main(['--workspace', str(tmp_path), 'run', '--yes', 'hello']) == 0
+    assert 'auto-approves' in capsys.readouterr().out.lower()
+
+
+def test_retry_on_520(monkeypatch):
+    calls = {'n': 0}
+    def urlopen(req, timeout):
+        calls['n'] += 1
+        if calls['n'] < 3:
+            raise HTTPError('url', 520, 'cf', {}, None)
+        return io.BytesIO(json.dumps({'choices': [{'finish_reason': 'stop', 'message': {
+            'role': 'assistant', 'content': 'OK'}}], 'usage': {'total_tokens': 1}}).encode())
+    monkeypatch.setattr('urllib.request.urlopen', urlopen)
+    monkeypatch.setattr('you_agent.provider.time.sleep', lambda *_: None)
+    message, _ = Provider('fake').generate([{'role': 'user', 'content': 'hi'}], 'system')
+    assert message['content'] == 'OK'
+    assert calls['n'] == 3

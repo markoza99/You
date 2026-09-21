@@ -51,7 +51,9 @@ you chat 'Say hi in one short sentence.'
 you run 'Create a hello.py script that prints Hello, then read it back.'
 ```
 
-Writes display the exact content and require typing `yes`. Workspace default: `~/.local/share/you/workspace`. File contents read by tools are sent to the API.
+Writes display the exact content and require typing `yes`. For one run only, pass `--yes` to skip those prompts (scripts are still unsandboxed). There is no permanent auto-approve mode. Workspace default: `~/.local/share/you/workspace`. File contents read by tools are sent to the API.
+
+`--max-seconds` counts model request time only, not the time you spend at the approval prompt. HTTP 503/520 are retried a few times. Script stdout is printed after `run_python`.
 
 ### Optional Python execution
 

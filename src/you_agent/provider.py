@@ -1,6 +1,7 @@
 """OpenAI-compatible REST adapter (VyceAI / DeepSeek). No native package dependencies."""
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -21,6 +22,24 @@ class Provider:
         self.key, self.model, self.base, self.timeout = key, model, base, timeout
 
     def generate(self, messages, system, tools=None):
+        last = None
+        for attempt in range(4):
+            try:
+                return self._generate_once(messages, system, tools)
+            except ProviderError as exc:
+                last = exc
+                text = str(exc)
+                retryable = any(token in text for token in (
+                    "HTTP 503", "HTTP 520", "HTTP 522", "HTTP 524",
+                    "timed out", "Network request failed",
+                ))
+                if not retryable or attempt == 3:
+                    raise
+                wait = 2 ** attempt
+                time.sleep(wait)
+        raise last
+
+    def _generate_once(self, messages, system, tools=None):
         body = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}] + list(messages),

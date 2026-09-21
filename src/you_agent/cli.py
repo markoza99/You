@@ -13,13 +13,18 @@ SYSTEM = '''You are You, an autonomous agent running in Termux on the user's And
 The user gives a short goal. You work out the steps, do them, verify them, and report.
 
 LOOP
-1. think: one line naming the goal and your plan. Skip only for a single obvious call.
-2. Work out what you need. check_command tells you whether a program exists.
-3. Missing program? Install it yourself with pkg_install, then continue the job.
-4. Act with the smallest tool that does the work.
-5. Verify. Read the file back, inspect the output, query the state again.
-6. Failed? Read the error, form a new hypothesis, try a different way. Up to 5 real attempts.
-7. Report what the output proves. Be brief.
+1. think: one line naming the goal, the current state, and the next tool. Skip only for a single obvious call.
+2. Act with the smallest listed tool. There is no tool named shell. Terminal = run_shell.
+3. Verify from tool JSON. If the job is done, write any requested file, then stop.
+4. Failed? Change ONE thing. Never repeat the identical failing call.
+5. Blocked for real (denied, 404 DIAL YouTube, missing API, off-LAN)? Stop and say why.
+
+STATE
+- Facts in the user message are from earlier runs. Trust tv_youtube_dial and tv_ip unless a tool contradicts them.
+- youtube_dial_available=false or tv_youtube_dial=no means this TV cannot open YouTube via DIAL.
+  Do not dial_launch YouTube. Do not install pychromecast/cast/pip. Tell the user to use the TV remote
+  or Cast from the phone YouTube app. That is a complete answer.
+- pkg_install is for Termux apt packages (nmap, curl, dnsutils). It cannot install PyPI modules.
 
 BE SELF-SUFFICIENT
 - Never ask the user to run a command you can run yourself.
@@ -52,10 +57,11 @@ TERMUX FACTS
 - If lan_scan.incomplete is true or count is 1, do NOT stop. Next call ssdp_discover, then
   local_ipv4. Report every IP you have, even if MAC is unknown. Permission denied on ARP is
   expected on Android, not a reason to quit.
-- There is no tool named shell. The terminal tool is run_shell. If a tool is unknown, pick one from the list; do not retry the invented name.
+- There is no tool named shell. The terminal tool is run_shell. If a tool is unknown, pick one from the list; do not retry the invented name even once.
 - run_shell uses bash. Android often denies /proc/net/arp and ip neigh; that is not a missing-tool problem.
 - Downloads and installs belong in pkg_install: run_shell has a much shorter timeout.
 - Termux nslookup is package dnsutils, not bind-tools. Never install dnsmasq for DNS lookup.
+- Never pkg_install pychromecast, python-*, pip, or Cast libraries. Those are not Termux packages.
 - If a report file is requested, write it before you hit token/step limits. Unknown is allowed.
 
 MEMORY
@@ -135,7 +141,7 @@ def parse_tool_arguments(raw):
     return parsed
 
 
-def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds=240):
+def run_agent(provider, tools, goal, max_steps=16, max_tokens=60000, max_seconds=240):
     if not goal.strip() or len(goal) > 16000:
         raise ValueError('Goal must be between 1 and 16000 characters.')
     if min(max_steps, max_tokens, max_seconds) <= 0:
@@ -144,6 +150,7 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds
     messages = [{'role': 'user', 'content': with_memory(goal, facts)}]
     used = 0.0
     total = 0
+    fail_counts = {}
     openai_tools = tools.openai_tools if hasattr(tools, 'openai_tools') else None
     for step in range(max_steps):
         if used >= max_seconds:
@@ -180,6 +187,19 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds
             facts = remember_from_result(facts, name, result)
             if name == 'memory_set' and result.get('ok'):
                 facts = load_memory()
+            if not result.get('ok'):
+                sig = name + '|' + json.dumps(args, sort_keys=True, default=str)[:180]
+                fail_counts[sig] = fail_counts.get(sig, 0) + 1
+                if fail_counts[sig] >= 2:
+                    result = dict(result)
+                    result['stop'] = True
+                    result['error'] = (result.get('error') or 'failed') + (
+                        ' Repeated identical failure. Pick a different listed tool or stop.')
+                if name == 'shell' or (isinstance(result.get('error'), str)
+                                       and 'Unknown tool' in result['error']
+                                       and fail_counts.get(sig, 0) >= 1):
+                    result = dict(result)
+                    result['stop'] = True
             status = 'ok' if result.get('ok') else 'failed/denied'
             extra = ''
             if name in ('run_python', 'run_shell') and result.get('output'):
@@ -194,6 +214,15 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=40000, max_seconds
                 'tool_call_id': call.get('id') or name,
                 'content': json.dumps(result, ensure_ascii=True),
             })
+            if result.get('stop'):
+                save_memory(facts)
+                return {
+                    'status': 'blocked',
+                    'reason': result.get('error', 'blocked'),
+                    'text': tools.redact(str(result.get('error', 'blocked'))),
+                    'tokens': total,
+                    'steps': step + 1,
+                }
     save_memory(facts)
     return {'status': 'limit_reached', 'reason': 'Maximum agent steps', 'tokens': total}
 

@@ -65,11 +65,21 @@ def remember_from_result(facts, name, result):
     return updated
 
 
+ENV_CARD = (
+    'Environment: Termux on Android. Tools you actually have: think, memory_get, memory_set, '
+    'list_files, read_file, write_file, run_shell, run_python, open_url, android_check, '
+    'check_command, pkg_install, local_ipv4, ssdp_discover, lan_scan, lan_probe, '
+    'dial_inspect, dial_launch. There is no tool named shell. pkg_install cannot install pip modules.'
+)
+
+
 def with_memory(goal, facts):
-    if not facts:
-        return goal
-    lines = ['Known facts from earlier runs (verify with tools if the task depends on them):']
-    for key, value in facts.items():
-        lines.append('- %s: %s' % (key, value))
+    lines = [ENV_CARD]
+    if facts:
+        lines.append('Known facts from earlier runs (verify with tools if the task depends on them):')
+        for key, value in facts.items():
+            lines.append('- %s: %s' % (key, value))
+        if facts.get('tv_youtube_dial') == 'no':
+            lines.append('HARD FACT: DIAL YouTube is not exposed on the remembered TV. Do not launch or install Cast stacks.')
     lines.append('User goal: ' + goal)
     return '\n'.join(lines)

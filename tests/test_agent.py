@@ -142,6 +142,42 @@ def test_dial_inspect_youtube_404(monkeypatch, tools):
     assert result['apps'][0]['status'] == 404
 
 
+def test_dial_launch_stops_when_youtube_404(monkeypatch, tools):
+    class FakeSock:
+        def connect(self, addr):
+            pass
+        def getsockname(self):
+            return ('192.168.1.78', 1)
+        def close(self):
+            pass
+    class FakeHTTP:
+        def __init__(self, host, port, timeout=None):
+            self.path = None
+            self.method = 'GET'
+        def request(self, method, path, headers=None, body=None):
+            self.path = path
+            self.method = method
+        def getresponse(self):
+            class Resp:
+                status = 200
+                def getheaders(self_inner):
+                    return [('Application-URL', 'http://192.168.1.64:8008/apps/')]
+                def read(self_inner, n=None):
+                    return b'<root><device><friendlyName>Android TV</friendlyName><manufacturer>SWTV</manufacturer><modelName>SWTV</modelName></device></root>'
+            resp = Resp()
+            if self.path and 'YouTube' in self.path:
+                resp.status = 404
+            return resp
+        def close(self):
+            pass
+    monkeypatch.setattr('you_agent.tools.socket.socket', lambda *a, **k: FakeSock())
+    monkeypatch.setattr('you_agent.tools.http.client.HTTPConnection', FakeHTTP)
+    result = tools.execute('dial_launch', {'ip': '192.168.1.64', 'app': 'YouTube'})
+    assert not result['ok']
+    assert result.get('stop') is True
+    assert '404' in result['error'] or 'not exposed' in result['error']
+
+
 def test_dial_launch_denied(monkeypatch, tools):
     tools.approve = lambda *_: False
     class FakeSock:
@@ -515,6 +551,36 @@ def test_lan_probe_unknown_is_ok(monkeypatch, tools):
     assert result['ok']
     assert result['alive'] is True
     assert result['identity'] == 'unknown'
+
+
+def test_pkg_install_refuses_pychromecast(tools):
+    result = tools.execute('pkg_install', {'package': 'pychromecast'})
+    assert not result['ok']
+    assert result.get('stop') is True
+    assert 'pip' in result['error'].lower() or 'apt' in result['error'].lower()
+
+
+def test_with_memory_includes_environment_and_hard_fact():
+    from you_agent.memory import with_memory
+    text = with_memory('open youtube on tv', {'tv_ip': '192.168.1.64', 'tv_youtube_dial': 'no'})
+    assert 'no tool named shell' in text.lower() or 'There is no tool named shell' in text
+    assert 'HARD FACT' in text
+    assert 'User goal: open youtube on tv' in text
+
+
+def test_circuit_breaker_stops_repeated_unknown_tool(tools):
+    class Fake:
+        def __init__(self):
+            self.n = 0
+        def generate(self, messages, system, tools=None):
+            self.n += 1
+            if self.n > 3:
+                return {'role': 'assistant', 'content': 'gave up'}, {'totalTokenCount': 1}
+            return {'role': 'assistant', 'content': 'try shell', 'tool_calls': [{
+                'id': 'c%d' % self.n, 'type': 'function',
+                'function': {'name': 'shell', 'arguments': '{"command":"echo hi"}'}}]}, {'totalTokenCount': 5}
+    result = run_agent(Fake(), tools, 'do a thing')
+    assert result['status'] in ('blocked', 'answered')
 
 
 def test_pkg_install_refuses_dnsmasq(tools):

@@ -555,6 +555,16 @@ class Tools:
         if app not in allowed:
             raise ValueError('app must be one of: ' + ', '.join(sorted(allowed)))
         inspect = self.dial_inspect(ip)
+        youtube_apps = {'YouTube', 'YouTubeLeanback', 'YouTubeTV'}
+        if app in youtube_apps and not inspect.get('youtube_dial_available'):
+            return {
+                'ok': False,
+                'error': 'DIAL YouTube is not exposed on this TV (HTTP 404). Do not retry, '
+                         'do not install Cast libraries. Use the TV remote or Cast from the '
+                         'phone YouTube app.',
+                'inspect': inspect,
+                'stop': True,
+            }
         app_base = inspect['application_url']
         parsed = urlparse(app_base)
         path = urlparse(urljoin(app_base, app)).path or '/'
@@ -766,6 +776,19 @@ class Tools:
             return {'ok': False, 'package': package,
                     'error': 'dnsmasq is a DHCP/DNS server, not nslookup. For reverse DNS use '
                              'lan_probe. To install nslookup: pkg_install dnsutils.'}
+        pip_names = {
+            'pychromecast', 'cast', 'chromecast', 'pip', 'python-pip', 'setuptools',
+            'youtube-dl', 'yt-dlp', 'requests', 'beautifulsoup4',
+        }
+        if mapped in pip_names or mapped.startswith('python-') or mapped.startswith('py3-'):
+            return {
+                'ok': False,
+                'package': package,
+                'error': 'pkg_install is Termux apt only, not pip. Do not install %s. '
+                         'If DIAL YouTube is 404, stop; Cast from the phone YouTube app instead.'
+                         % package,
+                'stop': True,
+            }
         if not shutil.which('pkg'):
             return {'ok': False, 'package': package,
                     'error': 'pkg is not available; this does not look like Termux.'}

@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import socket
 import sys
 from urllib.error import HTTPError
@@ -375,6 +376,34 @@ def test_no_arg_tools_ignore_stray_arguments(monkeypatch, tmp_path, tools):
     # The model sometimes sends stray keys; a no-arg tool must still run.
     assert tools.execute('memory_get', {'query': 'tv'})['ok']
     assert tools.execute('local_ipv4', {'unused': 'x'}) is not None
+
+
+def test_child_env_keeps_android_vars_and_drops_secrets(monkeypatch, tools):
+    monkeypatch.setenv('ANDROID_DATA', '/data')
+    monkeypatch.setenv('BOOTCLASSPATH', '/apex/stuff.jar')
+    monkeypatch.setenv('TERMUX_VERSION', '0.118')
+    monkeypatch.setenv('YOU_API_KEY', 'sk-live-secret')
+    monkeypatch.setenv('SOME_COPY', 'prefix sk-live-secret suffix')
+    tools.secret = 'sk-live-secret'
+    env = tools._child_env()
+    # Android/Termux plumbing must survive or am and termux-* silently do nothing.
+    assert env['ANDROID_DATA'] == '/data'
+    assert env['BOOTCLASSPATH'] == '/apex/stuff.jar'
+    assert env['TERMUX_VERSION'] == '0.118'
+    # Secrets must not reach the child, including copies under other names.
+    assert 'YOU_API_KEY' not in env
+    assert 'SOME_COPY' not in env
+    assert not any('sk-live-secret' in v for v in env.values())
+
+
+def test_child_env_used_by_subprocess(tools):
+    tools.allow_python = True
+    os.environ['YOU_TEST_MARKER'] = 'marker-value'
+    try:
+        result = tools.execute('run_shell', {'command': 'echo "$YOU_TEST_MARKER"'})
+        assert 'marker-value' in result['output']
+    finally:
+        os.environ.pop('YOU_TEST_MARKER', None)
 
 
 def test_open_url_detects_blocked_am(monkeypatch, tools):

@@ -529,9 +529,22 @@ class Tools:
     def run_python(self, path):
         return self._run_process([sys.executable, '-I', str(path)])
 
+    def _child_env(self):
+        # Inherit the real Termux environment. am/app_process need ANDROID_DATA, ANDROID_ROOT
+        # and BOOTCLASSPATH, and termux-* helpers need TERMUX_*/LD_LIBRARY_PATH. Stripping the
+        # environment made both exit 0 while doing nothing. Remove only secret-bearing values.
+        env = dict(os.environ)
+        for name in ('YOU_API_KEY', 'VYCEAI_API_KEY', 'GEMINI_API_KEY',
+                     'OPENAI_API_KEY', 'ANTHROPIC_API_KEY'):
+            env.pop(name, None)
+        if self.secret:
+            for name, value in list(env.items()):
+                if isinstance(value, str) and self.secret in value:
+                    env.pop(name, None)
+        return env
+
     def _run_process(self, argv):
-        # Minimal inherited environment; never pass API keys to the child.
-        env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'LANG', 'PREFIX') if k in os.environ}
+        env = self._child_env()
         process = subprocess.Popen(argv, cwd=self.root,
                                    env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, start_new_session=True)

@@ -107,8 +107,14 @@ class Tools:
             if name not in expected:
                 raise ValueError("Unknown or disabled tool.")
             fields = expected[name]['parameters']['required']
-            if not isinstance(args, dict) or set(args) != set(fields):
-                raise ValueError("Tool arguments do not match the schema.")
+            if not isinstance(args, dict):
+                raise ValueError("Tool arguments must be a JSON object.")
+            if not fields:
+                # Tools that take no arguments: drop stray keys instead of failing the step.
+                args = {}
+            elif set(args) != set(fields):
+                raise ValueError("Tool arguments do not match the schema. Expected exactly: "
+                                 + ', '.join(sorted(fields)))
             if any(not isinstance(v, str) for v in args.values()):
                 raise ValueError("Tool arguments must be strings.")
             if name == 'local_ipv4':
@@ -440,30 +446,54 @@ class Tools:
         packages = self._run_process(
             ['/bin/sh', '-c', 'pm list packages 2>/dev/null | grep -i termux'])
         lines = [l.strip() for l in packages['output'].splitlines() if l.strip()]
-        api_app = any('com.termux.api' in l for l in lines)
+        # Android 11+ hides other packages from a normal app, so an empty list proves nothing.
+        listing_usable = bool(lines)
+        # Functional probe: if the Termux:API APP is installed and permitted, this returns JSON.
+        probe = self._run_process(['termux-battery-status']) if shutil.which(
+            'termux-battery-status') else {'ok': False, 'output': '', 'error': 'CLI missing'}
+        api_working = False
+        if probe.get('ok') and probe.get('output', '').strip().startswith('{'):
+            try:
+                json.loads(probe['output'])
+                api_working = True
+            except ValueError:
+                api_working = False
+        if api_working:
+            api_state = 'working'
+        elif listing_usable:
+            api_state = 'installed' if any('com.termux.api' in l for l in lines) else 'missing'
+        else:
+            api_state = 'unknown'
         version = self._run_process(
             ['/bin/sh', '-c', 'getprop ro.build.version.release; getprop ro.build.version.sdk'])
         release = version['output'].strip().splitlines()
         cli = {n: bool(shutil.which(n)) for n in
                ('termux-open-url', 'termux-toast', 'termux-battery-status', 'am', 'pm')}
         problems = []
-        if not api_app:
-            problems.append('The Termux:API app is NOT installed. "pkg install termux-api" only '
-                            'adds the CLI. Install the Termux:API app from the SAME store as '
-                            'Termux (F-Droid or Play), then retry.')
-        if cli['termux-open-url'] and api_app:
-            problems.append('CLI and app are present. If launching is still silent, Android is '
-                            'blocking the activity start: grant Termux "Display over other apps" '
-                            'in Android settings.')
+        if api_state == 'missing':
+            problems.append('The Termux:API app is not installed. "pkg install termux-api" only '
+                            'adds the CLI. Install the Termux:API app from the SAME store as Termux.')
+        elif api_state == 'unknown':
+            problems.append('Could not determine whether the Termux:API app is installed: '
+                            'pm list packages is filtered on Android 11+ and the battery probe '
+                            'did not return JSON. Ask the user to check Settings > Apps, and to '
+                            'confirm Termux and Termux:API come from the SAME store.')
+        if api_state == 'working':
+            problems.append('Termux:API is installed and responding. If a launch is still silent, '
+                            'the cause is Android activity-start restrictions: grant Termux '
+                            '"Display over other apps", and keep Termux in the foreground.')
         return {
             'ok': True,
+            'termux_api_state': api_state,
+            'termux_api_probe_output': probe.get('output', '')[:300],
+            'package_listing_usable': listing_usable,
             'termux_packages': lines,
-            'termux_api_app_installed': api_app,
             'cli_available': cli,
             'android_release_and_sdk': release,
             'problems': problems,
-            'note': 'Read-only check. pm list packages can be empty on some ROMs; an empty list is '
-                    'not proof the app is missing.',
+            'note': 'termux_api_state is the reliable field. An empty package list is NOT proof '
+                    'the app is missing: Android 11+ hides packages from normal apps. Never tell '
+                    'the user an app is missing based only on an empty package list.',
         }
 
     def run_shell(self, command):

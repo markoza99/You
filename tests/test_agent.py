@@ -337,8 +337,44 @@ def test_android_check_flags_missing_api_app(monkeypatch, tools):
         'error': None, 'truncated': False})
     result = tools.execute('android_check', {})
     assert result['ok'] is True
-    assert result['termux_api_app_installed'] is False
-    assert any('Termux:API app is NOT installed' in p for p in result['problems'])
+    # Listing worked and com.termux.api is absent, so "missing" is a sound conclusion here.
+    assert result['package_listing_usable'] is True
+    assert result['termux_api_state'] == 'missing'
+    assert any('Termux:API app is not installed' in p for p in result['problems'])
+
+
+def test_android_check_unknown_when_listing_empty(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/bin/' + name)
+    monkeypatch.setattr(Tools, '_run_process', lambda self, argv: {
+        'ok': True, 'exit_code': 0, 'output': '', 'error': None, 'truncated': False})
+    result = tools.execute('android_check', {})
+    # An empty package list must never be reported as "app missing".
+    assert result['termux_api_state'] == 'unknown'
+    assert not any('not installed' in p for p in result['problems'])
+
+
+def test_android_check_working_probe(monkeypatch, tools):
+    tools.allow_python = True
+    monkeypatch.setattr('you_agent.tools.shutil.which', lambda name: '/bin/' + name)
+    def fake(self, argv):
+        if argv[0] == 'termux-battery-status':
+            return {'ok': True, 'exit_code': 0, 'output': '{"percentage": 13}',
+                    'error': None, 'truncated': False}
+        return {'ok': True, 'exit_code': 0, 'output': '', 'error': None, 'truncated': False}
+    monkeypatch.setattr(Tools, '_run_process', fake)
+    result = tools.execute('android_check', {})
+    assert result['termux_api_state'] == 'working'
+    assert any('Display over other apps' in p for p in result['problems'])
+
+
+def test_no_arg_tools_ignore_stray_arguments(monkeypatch, tmp_path, tools):
+    import you_agent.memory as mem
+    monkeypatch.setattr(mem, 'MEMORY_PATH', tmp_path / 'memory.json')
+    monkeypatch.setattr(mem, 'CONFIG_DIR', tmp_path)
+    # The model sometimes sends stray keys; a no-arg tool must still run.
+    assert tools.execute('memory_get', {'query': 'tv'})['ok']
+    assert tools.execute('local_ipv4', {'unused': 'x'}) is not None
 
 
 def test_open_url_detects_blocked_am(monkeypatch, tools):

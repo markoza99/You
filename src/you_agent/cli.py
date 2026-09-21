@@ -4,10 +4,14 @@ import os
 from pathlib import Path
 import sys
 import time
+from collections import deque
 
 from .memory import load_memory, remember_from_result, save_memory, with_memory
 from .provider import Provider, ProviderError
 from .tools import Tools
+
+# Cap on how many distinct (tool, args) failure signatures are remembered for the report.
+_EVIDENCE_MAX = 24
 
 SYSTEM = '''You are You, an approval-controlled agent, primarily designed for Termux on Android.
 Use the runtime context for the actual platform, enabled tools, and execution permissions.
@@ -59,14 +63,18 @@ TERMUX FACTS
 - run_shell runs one command. run_python cannot execute a .sh file.
 - Big file? Use grep, head, tail or wc through run_shell instead of read_file.
 - Open a web page with open_url. Android can block activity starts silently.
-- LAN work: local_ipv4, ssdp_discover, lan_scan, lan_probe, dial_inspect, dial_launch. Stay on this phone's /24.
+- LAN work: local_ipv4, ssdp_discover, lan_scan, lan_probe, host_probe, dial_inspect, dial_launch. Stay on this phone's /24.
 - To list Wi-Fi devices with IP and MAC, call lan_scan. Do not write a ping loop.
 - To identify ONE LAN IP (ping, reverse DNS, HTTP/HTTPS), call lan_probe. Do not install
   nslookup, dnsmasq, bind-tools, or getent. identity=unknown is a valid answer.
+- To learn what one known host exposes, call host_probe with that single IP. It is bounded,
+  read-only, single-host, and does NOT do mDNS/SSDP/NetBIOS or OS fingerprinting.
 - If lan_scan.incomplete is true or count is 1, do NOT stop. Next call ssdp_discover, then
   local_ipv4. Report every IP you have, even if MAC is unknown. Permission denied on ARP is
   expected on Android, not a reason to quit.
-- There is no tool named shell. The terminal tool is run_shell. If a tool is unknown, pick one from the list; do not retry the invented name even once.
+- There is no tool named shell. The terminal tool is run_shell (only with --allow-python). If a
+  tool is unknown or disabled, the tool result lists the enabled tools and the exact flag to
+  enable it. Pick an enabled tool; do not retry the invented name.
 - run_shell uses bash. Android often denies /proc/net/arp and ip neigh; that is not a missing-tool problem.
 - Downloads and installs belong in pkg_install: run_shell has a much shorter timeout.
 - Termux nslookup is package dnsutils, not bind-tools. Never install dnsmasq for DNS lookup.
@@ -75,6 +83,21 @@ TERMUX FACTS
 
 MEMORY
 - memory_get when the goal leans on earlier facts. memory_set for durable ones like tv_ip.
+
+NETWORK & DISCOVERY SCOPE
+- Default to a SINGLE target IP. Do not sweep the whole /24 (lan_scan) unless the goal actually
+  needs to find unknown devices. One known IP -> lan_probe or host_probe, not a scan.
+- Probe the target host directly with host_probe/lan_probe instead of repeating dial_inspect.
+  If a port was already observed refused (e.g. 8008 DIAL 404), do not re-probe the same port
+  expecting a different answer.
+- Discovery is UDP multicast where the protocol is multicast: ssdp_discover is SSDP over UDP to
+  239.255.255.250:1900. Do not rewrite it as TCP, and do not loop TCP connections to "discover".
+- A TTL of 64 is a normal IPv4 hop limit, NOT an operating-system identity. Never guess the OS
+  from TTL alone.
+- A router's HTTP banner is router UI text, NOT a DHCP lease table. It does not list devices or
+  IPs. Do not treat a router banner as a device list or as the target vendor.
+- host_probe and lan_probe are read-only and single-host. They report open/closed ports and
+  banners as hints only. They never authenticate, fingerprint the OS, pair, or launch anything.
 
 LIMITS
 - Stay inside the goal. Install or change nothing unrelated to it.
@@ -150,6 +173,35 @@ def parse_tool_arguments(raw):
     return parsed
 
 
+def _evidence_list(evidence):
+    """Flatten the bounded evidence dict into an ordered, de-duplicated list for the report."""
+    items = []
+    for sig, entry in evidence.items():
+        items.append({
+            'tool': entry['tool'],
+            'args': entry['args'],
+            'kind': entry['kind'],
+            'error': entry['error'][:240],
+            'attempts': entry['attempts'],
+        })
+    return items
+
+
+def _finish(status, reason, text, total, steps, evidence, note=None):
+    payload = {
+        'status': status,
+        'reason': reason,
+        'tokens': total,
+        'steps': steps,
+        'evidence': _evidence_list(evidence),
+    }
+    if text is not None:
+        payload['text'] = text
+    if note is not None:
+        payload['note'] = note
+    return payload
+
+
 def run_agent(provider, tools, goal, max_steps=16, max_tokens=60000, max_seconds=240):
     if not goal.strip() or len(goal) > 16000:
         raise ValueError('Goal must be between 1 and 16000 characters.')
@@ -160,12 +212,51 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=60000, max_seconds
     messages = [{'role': 'user', 'content': with_memory(goal, facts, context)}]
     used = 0.0
     total = 0
-    fail_counts = {}
     openai_tools = tools.openai_tools if hasattr(tools, 'openai_tools') else None
+    # Bounded memory of the model's tool calls for the final evidence report.
+    evidence = {}
+    order = []
+
+    def record(name, args, kind, error):
+        sig = name + '|' + json.dumps(args, sort_keys=True, default=str)[:180]
+        if sig in evidence:
+            entry = evidence[sig]
+            entry['attempts'] += 1
+            entry['kind'] = kind
+            return sig
+        entry = {'tool': name, 'args': args, 'kind': kind, 'error': error, 'attempts': 1}
+        if len(evidence) >= _EVIDENCE_MAX:
+            oldest = order.pop(0)
+            evidence.pop(oldest, None)
+        evidence[sig] = entry
+        order.append(sig)
+        return sig
+
+    def report_note(reason, kind):
+        ev = _evidence_list(evidence)
+        parts = [reason + '. ']
+        if ev:
+            tried = []
+            for item in ev[:12]:
+                tried.append('%s %s -> %s' % (item['tool'],
+                                              json.dumps(item['args'], ensure_ascii=True)[:80],
+                                              item['kind']))
+            parts.append('Observed tool outcomes (evidence): ' + '; '.join(tried) + '.')
+        if kind == 'blocked':
+            parts.append('The run stopped because the user denied an action; no further '
+                         'side effects were attempted. Report what was denied and what '
+                         'remains, and stop.')
+        elif kind == 'limit_reached':
+            parts.append('The run hit its budget before finishing. Report the partial '
+                         'results above honestly, do not claim anything unverified, and '
+                         'make no further tool calls.')
+        return ''.join(parts)
+
     for step in range(max_steps):
         if used >= max_seconds:
             save_memory(facts)
-            return {'status': 'limit_reached', 'reason': 'Runtime limit', 'tokens': total}
+            return _finish('limit_reached', 'Runtime limit', None, total, step + 1, evidence,
+                           note=report_note('Runtime limit reached', 'limit_reached'))
         started = time.monotonic()
         message, usage = provider.generate(messages, SYSTEM, openai_tools)
         used += time.monotonic() - started
@@ -173,19 +264,24 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=60000, max_seconds
         messages.append(message)
         if total >= max_tokens:
             save_memory(facts)
-            return {'status': 'limit_reached', 'reason': 'Token usage threshold', 'tokens': total}
+            return _finish('limit_reached', 'Token usage threshold', None, total, step + 1,
+                           evidence, note=report_note('Token usage threshold reached',
+                                                       'limit_reached'))
         thought = (message.get('content') or '').strip()
-        if thought and (message.get('tool_calls') or []):
-            safe_print('Thinking: ' + tools.redact(thought)[:1000])
         calls = message.get('tool_calls') or []
+        if thought and calls:
+            safe_print('Thinking: ' + tools.redact(thought)[:1000])
         if not calls:
             text = thought
             if not text:
                 raise ProviderError('Model returned neither visible text nor tool calls.')
             save_memory(facts)
-            return {'status': 'answered', 'text': tools.redact(text), 'tokens': total, 'steps': step + 1}
+            return _finish('answered', 'answered', tools.redact(text), total, step + 1, evidence)
         if len(calls) > 4:
-            return {'status': 'limit_reached', 'reason': 'Too many tool calls in one response', 'tokens': total}
+            return _finish('limit_reached', 'Too many tool calls in one response', None,
+                           total, step + 1, evidence,
+                           note=report_note('Too many tool calls in one response',
+                                             'limit_reached'))
         for call in calls:
             function = call.get('function') or {}
             name = function.get('name', '')
@@ -200,22 +296,29 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=60000, max_seconds
                 facts = load_memory()
             if not result.get('ok'):
                 sig = name + '|' + json.dumps(args, sort_keys=True, default=str)[:180]
-                fail_counts[sig] = fail_counts.get(sig, 0) + 1
-                if fail_counts[sig] >= 2:
-                    result = dict(result)
-                    result['stop'] = True
-                    result['error'] = (result.get('error') or 'failed') + (
-                        ' Repeated identical failure. Pick a different listed tool or stop.')
-                if name == 'shell' or (isinstance(result.get('error'), str)
-                                       and 'Unknown tool' in result['error']
-                                       and fail_counts.get(sig, 0) >= 1):
-                    result = dict(result)
-                    result['stop'] = True
+                kind = 'denied' if result.get('denied') else 'failed'
+                record(name, args, kind, str(result.get('error') or 'failed'))
+                # Recovery: an unknown/invented or disabled tool must NOT end the goal. The
+                # structured result already lists the enabled tools and (for a disabled
+                # execution tool) the exact CLI flag. Let the model recover.
+                if result.get('error_kind') != 'unknown_tool':
+                    attempt = evidence[sig]['attempts']
+                    if attempt >= 3:
+                        # Repeated identical failure: do not silently kill the goal. Flag it so
+                        # the model reports the blocker instead of looping on this exact call.
+                        result = dict(result)
+                        result['error'] = (result.get('error') or 'failed') + (
+                            ' This exact call has failed %d times. Do not repeat it. If nothing '
+                            'else is possible, write your report now and stop.' % attempt)
+
             status = 'denied' if result.get('denied') else ('ok' if result.get('ok') else 'failed')
             extra = ''
             if name in ('run_python', 'run_shell') and result.get('output'):
                 extra = '\n' + result['output'][:2000]
-            elif name in ('local_ipv4', 'ssdp_discover', 'lan_scan', 'lan_probe', 'dial_inspect', 'dial_launch', 'think', 'memory_get', 'memory_set', 'open_url', 'android_check', 'check_command', 'pkg_install'):
+            elif name in ('local_ipv4', 'ssdp_discover', 'lan_scan', 'lan_probe', 'host_probe',
+                          'dial_inspect', 'dial_launch', 'tv_capabilities', 'environment_info',
+                          'think', 'memory_get', 'memory_set', 'open_url', 'android_check',
+                          'check_command', 'pkg_install'):
                 extra = '\n' + json.dumps(result, ensure_ascii=True)[:2000]
             elif not result.get('ok') and result.get('error'):
                 extra = ' (' + str(result['error'])[:200] + ')'
@@ -225,17 +328,16 @@ def run_agent(provider, tools, goal, max_steps=16, max_tokens=60000, max_seconds
                 'tool_call_id': call.get('id') or name,
                 'content': json.dumps(result, ensure_ascii=True),
             })
-            if result.get('denied') or result.get('stop'):
+            # A user denial is terminal: stop before any remaining calls in this turn run.
+            if result.get('denied'):
                 save_memory(facts)
-                return {
-                    'status': 'blocked',
-                    'reason': result.get('error', 'blocked'),
-                    'text': tools.redact(str(result.get('error', 'blocked'))),
-                    'tokens': total,
-                    'steps': step + 1,
-                }
+                return _finish('blocked', result.get('error', 'denied'),
+                               tools.redact(str(result.get('error', 'blocked'))),
+                               total, step + 1, evidence,
+                               note=report_note('Action denied by user', 'blocked'))
     save_memory(facts)
-    return {'status': 'limit_reached', 'reason': 'Maximum agent steps', 'tokens': total}
+    return _finish('limit_reached', 'Maximum agent steps', None, total, max_steps, evidence,
+                   note=report_note('Maximum agent steps reached', 'limit_reached'))
 
 
 def main(argv=None):
